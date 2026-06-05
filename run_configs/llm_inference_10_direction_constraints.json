@@ -1,0 +1,34 @@
+{
+  "coverage_requirement": "Produce exactly 10 distinct directions spanning different mechanism families. If two ideas fall in the same family, they must attack different bottlenecks and expose different experiments.",
+  "direction_families": [
+    "KV-cache reuse or cross-token state sharing",
+    "KV-cache compression, eviction, or memory layout optimization",
+    "speculative decoding or verification acceleration",
+    "attention sparsity, head skipping, or token pruning",
+    "FFN sparsity or conditional computation",
+    "early exit, adaptive depth, or layer skipping",
+    "offloading, prefetching, or bandwidth-aware scheduling",
+    "hardware-software co-design, batching, or kernel fusion",
+    "sequence-level or chunk-level parallel generation",
+    "runtime routing or input-adaptive inference control"
+  ],
+  "hard_constraints": [
+    "No retraining, finetuning, distillation, or extra alignment training.",
+    "Each direction must include a concrete mechanism and a falsifiable validation plan.",
+    "Each direction must name the primary bottleneck it addresses: compute, memory bandwidth, latency, cache pressure, or verification overhead.",
+    "Each direction must justify novelty beyond plain MTP-like speculative decoding."
+  ],
+  "avoid": [
+    "Generic quantization-only ideas without a new runtime mechanism.",
+    "Near-duplicate speculative decoding variants that only swap the draft model.",
+    "Broad hardware recommendations without algorithmic details.",
+    "Directions that require custom training data or offline policy learning."
+  ],
+  "success_metrics": [
+    "End-to-end latency reduction",
+    "Throughput increase",
+    "Memory bandwidth reduction",
+    "Accuracy or quality retention",
+    "Scalability across sequence length or model size"
+  ]
+}

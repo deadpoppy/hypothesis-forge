@@ -1,0 +1,38 @@
+[
+  {
+    "name": "balanced_frontier",
+    "description": "Default long-run profile that balances early exploration with steadier later mutations.",
+    "generation_temperature": 0.86,
+    "evolution_temperature": 0.68,
+    "reflection_temperature": 0.3,
+    "top_k_hypotheses": 4,
+    "ranking_matches_per_cycle": 10,
+    "deep_review_top_k": 4,
+    "max_literature_results": 5,
+    "max_concurrency": 4
+  },
+  {
+    "name": "diversity_push",
+    "description": "More aggressive exploration for early-cycle breadth when clusters collapse too quickly.",
+    "generation_temperature": 0.9,
+    "evolution_temperature": 0.72,
+    "reflection_temperature": 0.3,
+    "top_k_hypotheses": 5,
+    "ranking_matches_per_cycle": 10,
+    "deep_review_top_k": 4,
+    "max_literature_results": 5,
+    "max_concurrency": 4
+  },
+  {
+    "name": "mutation_discipline",
+    "description": "Slightly cooler evolution profile to improve lineage legibility and avoid noisy rewrites.",
+    "generation_temperature": 0.82,
+    "evolution_temperature": 0.62,
+    "reflection_temperature": 0.28,
+    "top_k_hypotheses": 4,
+    "ranking_matches_per_cycle": 12,
+    "deep_review_top_k": 5,
+    "max_literature_results": 5,
+    "max_concurrency": 4
+  }
+]

@@ -1,0 +1,79 @@
+# Hypothesis Forge configuration template.
+# Copy this file to config.yaml for local runs:
+#   cp config.example.yaml config.yaml
+#
+# Keep config.yaml private. It may contain local API keys, provider URLs, and
+# experiment defaults that should not be committed.
+
+# LLM profiles
+# thinking_llm is used for planning, hypothesis generation, evolution, literature
+# query planning, and prior-art repair.
+thinking_llm:
+  api_key: null
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4.1"
+  model_fallbacks: []
+  base_url_fallbacks: []
+
+# critic_llm is used for safety checks, reflection, pairwise ranking, and
+# meta-review. It can point to the same provider/model as thinking_llm.
+critic_llm:
+  api_key: null
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4.1"
+  model_fallbacks: []
+  base_url_fallbacks: []
+
+llm_timeout_seconds: 520
+max_retries: 2
+initial_retry_delay: 2
+
+# Default run controls. With these set, a normal run only needs --goal and --output-dir.
+cycles: 5
+output_dir: "results"
+num_hypotheses: 5
+top_k_hypotheses: 3
+max_literature_results: 6
+ranking_matches_per_cycle: 1000
+deep_review_top_k: 3
+max_concurrency: 16
+
+# Scoring, review, and lifecycle controls
+elo_k_factor: 32
+proximity_similarity_threshold: 0.55
+hypothesis_decay_fraction: 0.10
+enable_safety_review: true
+enable_prior_art_check: true
+prior_art_queries_per_idea: 6
+prior_art_results_per_query: 50
+prior_art_embedding_candidates: 80
+prior_art_review_top_k: 12
+prior_art_similarity_threshold: 0.38
+prior_art_repair_attempts: 1
+
+# Literature grounding and cache
+literature_sources:
+  - semantic_scholar
+  - arxiv
+literature_cache_path: ".cache/literature_search_cache.json"
+arxiv_state_path: ".cache/arxiv_search_state.json"
+semantic_scholar_api_key: null
+semantic_scholar_timeout_seconds: 8
+semantic_scholar_min_delay_seconds: 2.0
+semantic_scholar_max_retries: 2
+semantic_scholar_retry_after_seconds: 8.0
+arxiv_failure_cooldown_seconds: 900
+arxiv_max_consecutive_failures: 3
+
+# Similarity model. Set local_files_only to false if you want first-run downloads.
+sentence_transformer_enabled: true
+sentence_transformer_model: "all-MiniLM-L6-v2"
+sentence_transformer_local_files_only: true
+
+# Temperature defaults by workflow stage.
+step_temperatures:
+  generation: 0.84
+  evolution: 0.68
+  reflection: 0.3
+
+logging_level: "INFO"

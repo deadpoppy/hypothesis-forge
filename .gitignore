@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+venv/
+__pycache__/
+*.pyc
+config.yaml
+.cache/
+.pytest_cache/
+results/app_log_*.txt
+results/
