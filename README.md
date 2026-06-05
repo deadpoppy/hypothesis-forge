@@ -47,7 +47,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The install includes the embedding stack (`sentence-transformers`, `scikit-learn`, `numpy`, and `torch`) because prior-art recall and hypothesis proximity scoring use semantic similarity for the full workflow.
+The install includes `transformers` and `torch` because prior-art recall and hypothesis proximity scoring use semantic embedding similarity for the full workflow. `scikit-learn` is not required.
 
 ## Configuration
 

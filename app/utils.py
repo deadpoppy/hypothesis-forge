@@ -152,32 +152,58 @@ _sentence_transformer_model = None
 _similarity_warning_emitted = False
 
 
+class _TransformerEmbeddingModel:
+    def __init__(self, model_name: str, local_files_only: bool) -> None:
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        self.torch = torch
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=local_files_only)
+        self.model = AutoModel.from_pretrained(model_name, local_files_only=local_files_only)
+        self.model.eval()
+
+    def encode(self, text: str):
+        encoded = self.tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        with self.torch.no_grad():
+            output = self.model(**encoded)
+        token_embeddings = output.last_hidden_state
+        attention_mask = encoded["attention_mask"].unsqueeze(-1).expand(token_embeddings.size()).float()
+        pooled = (token_embeddings * attention_mask).sum(dim=1) / attention_mask.sum(dim=1).clamp(min=1e-9)
+        return pooled.squeeze(0)
+
+
+def _resolve_embedding_model_name(model_name: str) -> str:
+    if "/" in model_name:
+        return model_name
+    return f"sentence-transformers/{model_name}"
+
+
 def get_sentence_transformer_model():
     global _sentence_transformer_model
     if _sentence_transformer_model is False:
         raise RuntimeError("Sentence transformer model is unavailable.")
     if _sentence_transformer_model is None:
-        from sentence_transformers import SentenceTransformer
-
         if not bool(config.get("sentence_transformer_enabled", True)):
             _sentence_transformer_model = False
             raise RuntimeError("Sentence transformer similarity is disabled by configuration.")
 
-        model_name = config.get("sentence_transformer_model", "all-MiniLM-L6-v2")
+        model_name = _resolve_embedding_model_name(config.get("sentence_transformer_model", "all-MiniLM-L6-v2"))
         local_files_only = bool(config.get("sentence_transformer_local_files_only", True))
         logger.info(
-            "Loading sentence transformer model: %s (local_files_only=%s)",
+            "Loading embedding model: %s (local_files_only=%s)",
             model_name,
             local_files_only,
         )
         try:
-            _sentence_transformer_model = SentenceTransformer(
-                model_name,
-                local_files_only=local_files_only,
-            )
+            _sentence_transformer_model = _TransformerEmbeddingModel(model_name, local_files_only)
         except Exception as exc:  # noqa: BLE001
             _sentence_transformer_model = False
-            raise RuntimeError(f"Sentence transformer load failed: {exc}") from exc
+            raise RuntimeError(f"Embedding model load failed: {exc}") from exc
     return _sentence_transformer_model
 
 
@@ -193,7 +219,7 @@ def lexical_similarity_score(text_a: str, text_b: str) -> float:
 @lru_cache(maxsize=4096)
 def _cached_embedding(text: str):
     model = get_sentence_transformer_model()
-    return model.encode(text, convert_to_tensor=True)
+    return model.encode(text)
 
 
 def similarity_score(text_a: str, text_b: str) -> float:
@@ -202,15 +228,15 @@ def similarity_score(text_a: str, text_b: str) -> float:
         return 0.0
 
     try:
-        import numpy as np
-        from sklearn.metrics.pairwise import cosine_similarity
-
         embedding_a = _cached_embedding(text_a)
         embedding_b = _cached_embedding(text_b)
-        embedding_a_np = embedding_a.cpu().numpy().reshape(1, -1)
-        embedding_b_np = embedding_b.cpu().numpy().reshape(1, -1)
-        similarity = cosine_similarity(embedding_a_np, embedding_b_np)[0][0]
-        return float(np.clip(similarity, 0.0, 1.0))
+        embedding_a = embedding_a.reshape(-1)
+        embedding_b = embedding_b.reshape(-1)
+        denominator = float((embedding_a.norm() * embedding_b.norm()).item())
+        if denominator <= 0.0:
+            return 0.0
+        similarity = float(((embedding_a * embedding_b).sum() / denominator).item())
+        return max(0.0, min(1.0, similarity))
     except Exception as exc:  # noqa: BLE001
         if not _similarity_warning_emitted:
             logger.warning("Similarity computation failed; using lexical fallback: %s", exc)

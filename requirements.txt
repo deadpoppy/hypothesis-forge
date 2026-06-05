@@ -3,7 +3,5 @@ pydantic
 PyYAML
 arxiv
 python-dateutil
-sentence-transformers
-scikit-learn
-numpy
+transformers
 torch
