@@ -65,10 +65,8 @@ semantic_scholar_retry_after_seconds: 8.0
 arxiv_failure_cooldown_seconds: 900
 arxiv_max_consecutive_failures: 3
 
-# Optional semantic similarity model. The lightweight default avoids installing
-# PyTorch; install requirements-embeddings.txt and enable this for embedding
-# similarity instead of lexical fallback.
-sentence_transformer_enabled: false
+# Semantic similarity model used for prior-art recall and hypothesis proximity.
+sentence_transformer_enabled: true
 sentence_transformer_model: "all-MiniLM-L6-v2"
 sentence_transformer_local_files_only: true
 

@@ -2,5 +2,8 @@ openai
 pydantic
 PyYAML
 arxiv
-feedparser
 python-dateutil
+sentence-transformers
+scikit-learn
+numpy
+torch

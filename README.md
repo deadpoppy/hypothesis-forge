@@ -47,11 +47,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The core install intentionally does not install PyTorch. Embedding-based similarity is optional; install it only when needed:
-
-```bash
-pip install -r requirements-embeddings.txt
-```
+The install includes the embedding stack (`sentence-transformers`, `scikit-learn`, `numpy`, and `torch`) because prior-art recall and hypothesis proximity scoring use semantic similarity for the full workflow.
 
 ## Configuration
 
@@ -88,12 +84,14 @@ export CRITIC_LLM_API_KEY="your_critic_key"
 
 For single-provider runs, `LLM_API_KEY` is also accepted as a shared fallback. Do not commit `config.yaml`.
 
-By default, semantic embedding similarity is disabled so the project remains lightweight. To enable it, install the optional embedding requirements and set:
+Semantic similarity is enabled by default:
 
 ```yaml
 sentence_transformer_enabled: true
-sentence_transformer_local_files_only: false
+sentence_transformer_local_files_only: true
 ```
+
+Keep `sentence_transformer_local_files_only: true` when the embedding model is already cached locally. Set it to `false` for a first run that should download `all-MiniLM-L6-v2`.
 
 ## Quick Start
 
@@ -194,7 +192,7 @@ python -m unittest discover -s tests
 
 - arXiv `429` responses trigger a cooldown saved at `arxiv_state_path`.
 - Semantic Scholar is optional. Without an API key, the workflow uses unauthenticated rate limits or continues with the remaining sources.
-- If embedding similarity is disabled or unavailable, similarity scoring falls back to lexical matching.
+- `sentence_transformer_local_files_only: true` requires the configured embedding model to already exist locally; otherwise similarity falls back to lexical matching.
 - Set `max_literature_results: 0` for LLM-only smoke tests without live literature grounding.
 
 ## Scope
