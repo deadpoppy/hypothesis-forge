@@ -47,7 +47,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The install includes `transformers` and `torch` because prior-art recall and hypothesis proximity scoring use semantic embedding similarity for the full workflow. `scikit-learn` is not required.
+The install includes `sentence-transformers` and `torch` because prior-art recall and hypothesis proximity scoring use semantic embedding similarity for the full workflow. `scikit-learn` and `numpy` are not listed directly because the repository code does not import them.
 
 ## Configuration
 

@@ -3,5 +3,5 @@ pydantic
 PyYAML
 arxiv
 python-dateutil
-transformers
+sentence-transformers
 torch
