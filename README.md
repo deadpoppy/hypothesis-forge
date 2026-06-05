@@ -1,8 +1,12 @@
 # Hypothesis Forge
 
+![Hypothesis Forge workflow](docs/assets/hypothesis-forge-overview.svg)
+
 Hypothesis Forge is a CLI-first research ideation engine inspired by the AI co-scientist workflow in [arXiv:2502.18864](https://arxiv.org/pdf/2502.18864). It turns a research goal into a structured plan, generates and evolves hypotheses over multiple cycles, grounds ideas with literature search, audits prior art, ranks candidates, and writes reviewable Markdown/JSON reports.
 
 The project is intentionally lightweight: it is built for local experimentation, reproducible idea sweeps, and quick inspection of how a pool of research hypotheses changes over time.
+
+For agents: copy `config.example.yaml` to `config.yaml`, set `thinking_llm` and `critic_llm`, then run `python app.py --goal "YOUR_RESEARCH_GOAL" --output-dir results/YOUR_RUN`.
 
 ## What It Does
 
@@ -21,9 +25,10 @@ The project is intentionally lightweight: it is built for local experimentation,
 ├── app.py                    # CLI entrypoint
 ├── app/                      # Workflow, agents, prompts, models, tools
 ├── config.example.yaml       # Public configuration template
+├── docs/assets/              # README and documentation assets
 ├── run_configs/              # Optional constraint/profile examples
 ├── tests/                    # Unit tests
-├── trajectory_sweep.py       # Helper for generating sweep commands
+├── trajectory_sweep.py       # Optional sweep runner for trajectory/debug profiles
 ├── Makefile
 └── README.md
 ```
@@ -40,6 +45,12 @@ cd hypothesis-forge
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+The core install intentionally does not install PyTorch. Embedding-based similarity is optional; install it only when needed:
+
+```bash
+pip install -r requirements-embeddings.txt
 ```
 
 ## Configuration
@@ -76,6 +87,13 @@ export CRITIC_LLM_API_KEY="your_critic_key"
 ```
 
 For single-provider runs, `LLM_API_KEY` is also accepted as a shared fallback. Do not commit `config.yaml`.
+
+By default, semantic embedding similarity is disabled so the project remains lightweight. To enable it, install the optional embedding requirements and set:
+
+```yaml
+sentence_transformer_enabled: true
+sentence_transformer_local_files_only: false
+```
 
 ## Quick Start
 
@@ -130,6 +148,8 @@ The Markdown report is usually the easiest artifact to inspect first. The JSON r
 
 ## Analysis Tools
 
+The `app/trajectory.py`, `app/evolution_analysis.py`, `trajectory_sweep.py`, and `run_configs/trajectory_profiles.json` files are optional diagnostics for understanding how hypothesis pools evolve. They are useful when you want to compare exploration settings, check lineage stability, or debug why a run converged too quickly.
+
 Trajectory analysis:
 
 ```bash
@@ -174,7 +194,7 @@ python -m unittest discover -s tests
 
 - arXiv `429` responses trigger a cooldown saved at `arxiv_state_path`.
 - Semantic Scholar is optional. Without an API key, the workflow uses unauthenticated rate limits or continues with the remaining sources.
-- `sentence_transformer_local_files_only: true` requires the configured embedding model to already exist locally; otherwise similarity falls back to lexical matching.
+- If embedding similarity is disabled or unavailable, similarity scoring falls back to lexical matching.
 - Set `max_literature_results: 0` for LLM-only smoke tests without live literature grounding.
 
 ## Scope
