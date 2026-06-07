@@ -84,6 +84,16 @@ export CRITIC_LLM_API_KEY="your_critic_key"
 
 For single-provider runs, `LLM_API_KEY` is also accepted as a shared fallback. Do not commit `config.yaml`.
 
+LLM calls retry until they succeed by default, which is useful when the provider is temporarily congested:
+
+```yaml
+llm_retry_until_success: true
+initial_retry_delay: 2
+max_retry_delay_seconds: 60
+```
+
+Set `llm_retry_until_success: false` only if you want `max_retries` to cap failed requests.
+
 Semantic similarity is enabled by default:
 
 ```yaml

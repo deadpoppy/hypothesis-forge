@@ -25,8 +25,10 @@ critic_llm:
   base_url_fallbacks: []
 
 llm_timeout_seconds: 520
+llm_retry_until_success: true
 max_retries: 2
 initial_retry_delay: 2
+max_retry_delay_seconds: 60
 
 # Default run controls. With these set, a normal run only needs --goal and --output-dir.
 cycles: 5

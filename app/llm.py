@@ -117,6 +117,20 @@ def _string_list(value: Any) -> List[str]:
     return [item for item in (_nonempty_string(item) for item in value) if item]
 
 
+def _config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
 def _role_env_api_key(profile: str | None) -> str | None:
     for prefix in _profile_prefixes(profile):
         env_prefix = prefix.upper()
@@ -270,8 +284,10 @@ def call_llm(
     profile: str | None = None,
 ) -> str:
     normalized_profile = _normalize_profile(profile)
-    max_retries = int(config.get("max_retries", 3))
     initial_delay = float(config.get("initial_retry_delay", 1))
+    retry_until_success = _config_bool(config.get("llm_retry_until_success"), default=True)
+    max_retries = None if retry_until_success else int(config.get("max_retries", 3))
+    max_retry_delay = float(config.get("max_retry_delay_seconds", 60))
     timeout_seconds = float(
         _first_profile_config_value(normalized_profile, ("timeout_seconds", "llm_timeout_seconds"))
         or config.get("llm_timeout_seconds", 60)
@@ -281,15 +297,20 @@ def call_llm(
     candidate_models = _candidate_models(model, normalized_profile)
     candidate_base_urls = _candidate_base_urls(normalized_profile)
 
-    for attempt in range(max_retries):
+    if not get_configured_api_key(normalized_profile):
+        raise LLMCallError(f"LLM API key is not configured for the '{normalized_profile}' profile.")
+
+    attempt = 0
+    while max_retries is None or attempt < max_retries:
+        attempt += 1
+        attempt_label = str(attempt) if max_retries is None else f"{attempt}/{max_retries}"
         for llm_model in candidate_models:
             for base_url in candidate_base_urls:
                 try:
                     client = _get_client(base_url=base_url, timeout_seconds=timeout_seconds, profile=normalized_profile)
                     logger.info(
-                        "LLM call attempt %d/%d using profile=%s model=%s base_url=%s temperature=%.2f",
-                        attempt + 1,
-                        max_retries,
+                        "LLM call attempt %s using profile=%s model=%s base_url=%s temperature=%.2f",
+                        attempt_label,
                         normalized_profile,
                         llm_model,
                         base_url or "default",
@@ -306,17 +327,18 @@ def call_llm(
                 except Exception as exc:  # noqa: BLE001
                     last_error = f"profile={normalized_profile} model={llm_model} base_url={base_url or 'default'} error={exc}"
                     logger.warning(
-                        "LLM call failed on attempt %d/%d with profile=%s model=%s base_url=%s: %s",
-                        attempt + 1,
-                        max_retries,
+                        "LLM call failed on attempt %s with profile=%s model=%s base_url=%s: %s",
+                        attempt_label,
                         normalized_profile,
                         llm_model,
                         base_url or "default",
                         exc,
                     )
 
-        if attempt < max_retries - 1:
-            time.sleep(initial_delay * (2 ** attempt))
+        if max_retries is None or attempt < max_retries:
+            delay = min(max_retry_delay, initial_delay * (2 ** (attempt - 1)))
+            logger.info("Retrying LLM call in %.1fs after failure: %s", delay, last_error)
+            time.sleep(delay)
 
     raise LLMCallError(last_error)
 

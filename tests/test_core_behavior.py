@@ -1259,11 +1259,62 @@ llm_base_url_fallbacks: []
         with patch("app.llm._candidate_models", return_value=["primary-model", "fallback-model"]), patch(
             "app.llm._candidate_base_urls",
             return_value=["http://provider.test/v1"],
-        ), patch("app.llm._get_client", return_value=fake_client):
+        ), patch("app.llm.get_configured_api_key", return_value="test-key"), patch(
+            "app.llm._get_client",
+            return_value=fake_client,
+        ):
             text = call_llm("Return ok", temperature=0.1)
 
         self.assertEqual(text, "{\"ok\":true}")
         self.assertEqual(fake_client.chat.completions.calls, ["primary-model", "fallback-model"])
+
+    def test_llm_call_retries_until_success_by_default(self):
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeCompletion:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        class FakeChatCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, model, messages, temperature):
+                self.calls += 1
+                if self.calls < 4:
+                    raise RuntimeError("502 Bad Gateway")
+                return FakeCompletion("{\"ok\":true}")
+
+        class FakeClient:
+            def __init__(self):
+                self.chat = type("Chat", (), {"completions": FakeChatCompletions()})()
+
+        fake_client = FakeClient()
+
+        with patch.dict(
+            llm_module.config,
+            {
+                "llm_retry_until_success": True,
+                "initial_retry_delay": 0,
+                "max_retry_delay_seconds": 0,
+            },
+        ), patch("app.llm._candidate_models", return_value=["primary-model"]), patch(
+            "app.llm._candidate_base_urls",
+            return_value=["http://provider.test/v1"],
+        ), patch("app.llm.get_configured_api_key", return_value="test-key"), patch(
+            "app.llm._get_client",
+            return_value=fake_client,
+        ):
+            text = call_llm("Return ok", temperature=0.1)
+
+        self.assertEqual(text, "{\"ok\":true}")
+        self.assertEqual(fake_client.chat.completions.calls, 4)
 
     def test_llm_critic_profile_uses_separate_config(self):
         class FakeMessage:
