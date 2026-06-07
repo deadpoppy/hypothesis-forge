@@ -20,6 +20,8 @@ class ArxivSearchTool:
         self.client = arxiv.Client(page_size=max_results, delay_seconds=0.5, num_retries=0)
         self.failure_cooldown_seconds = float(config.get("arxiv_failure_cooldown_seconds", 900.0))
         self.max_consecutive_failures = int(config.get("arxiv_max_consecutive_failures", 3))
+        self.rate_limit_max_retries = int(config.get("arxiv_rate_limit_max_retries", 1))
+        self.rate_limit_retry_after_seconds = float(config.get("arxiv_rate_limit_retry_after_seconds", 20.0))
         self.state_path = Path(config.get("arxiv_state_path", ".cache/arxiv_search_state.json"))
         self._consecutive_failures = 0
         self._disabled_until = 0.0
@@ -102,64 +104,83 @@ class ArxivSearchTool:
         if search_query != query:
             logger.debug(f"Expanded search query: '{search_query}'")
             
-        try:
-            start_time = time.time()
-            
-            search = arxiv.Search(
-                query=search_query,
-                max_results=max_results,
-                sort_by=sort_criterion,
-                sort_order=arxiv.SortOrder.Descending
-            )
-            
-            papers = []
-            for paper in self.client.results(search):
-                papers.append(self._format_paper(paper))
-                
-            search_time = (time.time() - start_time) * 1000  # Convert to ms
-            
-            # Enhanced logging with performance metrics
-            logger.info(f"ArXiv search completed - Found {len(papers)} papers for query: '{query}' "
-                       f"in {search_time:.2f}ms")
-            
-            # Log paper details at debug level
-            if papers and logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"ArXiv papers found:")
-                for i, paper in enumerate(papers[:3], 1):  # Log first 3 papers
-                    logger.debug(f"  {i}. {paper['title']} ({paper['arxiv_id']}) - "
-                               f"Published: {paper['published']}")
-                if len(papers) > 3:
-                    logger.debug(f"  ... and {len(papers) - 3} more papers")
-            
-            # Log categories distribution
-            if papers:
-                categories_count = {}
-                for paper in papers:
-                    for cat in paper.get('categories', []):
-                        categories_count[cat] = categories_count.get(cat, 0) + 1
-                top_categories = sorted(categories_count.items(), key=lambda x: x[1], reverse=True)[:5]
-                logger.info(f"ArXiv search result categories: {dict(top_categories)}")
+        search = arxiv.Search(
+            query=search_query,
+            max_results=max_results,
+            sort_by=sort_criterion,
+            sort_order=arxiv.SortOrder.Descending
+        )
 
-            self._consecutive_failures = 0
-            self._disabled_until = 0.0
-            self._save_state()
-            
-            return papers
-            
-        except Exception as e:
-            rate_limited = self._is_rate_limited_error(e)
-            self._consecutive_failures += 1
-            if rate_limited or self._consecutive_failures >= self.max_consecutive_failures:
-                self._disabled_until = time.time() + self.failure_cooldown_seconds
-            self._save_state()
-            logger.warning(
-                "ArXiv live search disabled for %.0fs after %d consecutive failures%s.",
-                self.failure_cooldown_seconds,
-                self._consecutive_failures,
-                " due to rate limiting" if rate_limited else "",
-            )
-            logger.error(f"ArXiv search failed for query '{query}': {e}", exc_info=True)
-            return []
+        for attempt in range(self.rate_limit_max_retries + 1):
+            try:
+                start_time = time.time()
+
+                papers = []
+                for paper in self.client.results(search):
+                    papers.append(self._format_paper(paper))
+
+                search_time = (time.time() - start_time) * 1000  # Convert to ms
+
+                # Enhanced logging with performance metrics
+                logger.info(f"ArXiv search completed - Found {len(papers)} papers for query: '{query}' "
+                           f"in {search_time:.2f}ms")
+
+                # Log paper details at debug level
+                if papers and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"ArXiv papers found:")
+                    for i, paper in enumerate(papers[:3], 1):  # Log first 3 papers
+                        logger.debug(f"  {i}. {paper['title']} ({paper['arxiv_id']}) - "
+                                   f"Published: {paper['published']}")
+                    if len(papers) > 3:
+                        logger.debug(f"  ... and {len(papers) - 3} more papers")
+
+                # Log categories distribution
+                if papers:
+                    categories_count = {}
+                    for paper in papers:
+                        for cat in paper.get('categories', []):
+                            categories_count[cat] = categories_count.get(cat, 0) + 1
+                    top_categories = sorted(categories_count.items(), key=lambda x: x[1], reverse=True)[:5]
+                    logger.info(f"ArXiv search result categories: {dict(top_categories)}")
+
+                self._consecutive_failures = 0
+                self._disabled_until = 0.0
+                self._save_state()
+
+                return papers
+
+            except Exception as e:
+                rate_limited = self._is_rate_limited_error(e)
+                if rate_limited and attempt < self.rate_limit_max_retries:
+                    logger.warning(
+                        "ArXiv rate-limited query '%s'; retrying in %.1fs (%d/%d)",
+                        query,
+                        self.rate_limit_retry_after_seconds,
+                        attempt + 1,
+                        self.rate_limit_max_retries,
+                    )
+                    time.sleep(self.rate_limit_retry_after_seconds)
+                    continue
+
+                self._consecutive_failures += 1
+                if rate_limited or self._consecutive_failures >= self.max_consecutive_failures:
+                    self._disabled_until = time.time() + self.failure_cooldown_seconds
+                self._save_state()
+                logger.warning(
+                    "ArXiv live search skipped for query '%s' after %d consecutive failures%s.",
+                    query,
+                    self._consecutive_failures,
+                    " due to rate limiting" if rate_limited else "",
+                )
+                if self._disabled_until:
+                    logger.warning("ArXiv live search disabled for %.0fs.", self.failure_cooldown_seconds)
+                if rate_limited:
+                    logger.warning("ArXiv search skipped for query '%s' after rate limit retry failed: %s", query, e)
+                else:
+                    logger.error(f"ArXiv search failed for query '{query}': {e}", exc_info=True)
+                return []
+
+        return []
     
     def search_by_author(self, author_name: str, max_results: Optional[int] = None) -> List[Dict]:
         """Search for papers by a specific author"""

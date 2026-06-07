@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import unittest
+import urllib.error
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -32,6 +33,7 @@ from app.llm import call_llm
 from app.models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan
 from app.prompts import _serialize_literature, build_evolution_messages
 from app.tools.arxiv_search import ArxivSearchTool
+from app.tools.semantic_scholar import SemanticScholarSearchTool
 from app.trajectory import analyze_run_payload
 from app.utils import coerce_string_list, similarity_score
 from app.workflow import SupervisorAgent
@@ -1615,29 +1617,111 @@ llm_base_url_fallbacks: []
         self.assertEqual(len(notes), 2)
         self.assertIn(23, [note.get("citation_count") for note in notes])
 
-    def test_arxiv_429_disables_live_search_immediately(self):
+    def test_arxiv_429_retries_once_before_skipping_live_search(self):
         with TemporaryDirectory() as temp_dir, patch.dict(
             "app.tools.arxiv_search.config",
-            {"arxiv_state_path": f"{temp_dir}/arxiv_state.json"},
+            {
+                "arxiv_state_path": f"{temp_dir}/arxiv_state.json",
+                "arxiv_rate_limit_max_retries": 1,
+                "arxiv_rate_limit_retry_after_seconds": 0,
+            },
             clear=False,
         ):
             tool = ArxivSearchTool(max_results=2)
 
-            with patch.object(tool.client, "results", side_effect=RuntimeError("HTTP 429 Too Many Requests")):
+            with patch.object(tool.client, "results", side_effect=RuntimeError("HTTP 429 Too Many Requests")) as mocked_results, patch(
+                "app.tools.arxiv_search.time.sleep"
+            ) as mocked_sleep:
                 notes = tool.search_papers("kv cache")
 
             self.assertEqual(notes, [])
             self.assertGreater(tool._disabled_until, 0.0)
             self.assertEqual(tool._consecutive_failures, 1)
+            self.assertEqual(mocked_results.call_count, 2)
+            mocked_sleep.assert_called_once_with(0.0)
+
+    def test_arxiv_429_retry_can_recover_live_search(self):
+        with TemporaryDirectory() as temp_dir, patch.dict(
+            "app.tools.arxiv_search.config",
+            {
+                "arxiv_state_path": f"{temp_dir}/arxiv_state.json",
+                "arxiv_rate_limit_max_retries": 1,
+                "arxiv_rate_limit_retry_after_seconds": 0,
+            },
+            clear=False,
+        ):
+            tool = ArxivSearchTool(max_results=2)
+            formatted_paper = {"source": "arxiv", "title": "Recovered Paper", "arxiv_id": "2501.00001v1"}
+
+            with patch.object(
+                tool.client,
+                "results",
+                side_effect=[RuntimeError("HTTP 429 Too Many Requests"), [object()]],
+            ) as mocked_results, patch.object(tool, "_format_paper", return_value=formatted_paper), patch(
+                "app.tools.arxiv_search.time.sleep"
+            ) as mocked_sleep:
+                notes = tool.search_papers("kv cache")
+
+            self.assertEqual(notes, [formatted_paper])
+            self.assertEqual(tool._disabled_until, 0.0)
+            self.assertEqual(tool._consecutive_failures, 0)
+            self.assertEqual(mocked_results.call_count, 2)
+            mocked_sleep.assert_called_once_with(0.0)
+
+    def test_semantic_scholar_429_retries_once_before_skipping(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return b'{"data":[{"paperId":"S2-1","title":"Recovered Paper"}]}'
+
+        rate_limit_error = urllib.error.HTTPError(
+            url="https://api.semanticscholar.org/graph/v1/paper/search",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={},
+            fp=None,
+        )
+
+        with patch.dict(
+            "app.tools.semantic_scholar.config",
+            {
+                "semantic_scholar_max_retries": 1,
+                "semantic_scholar_retry_after_seconds": 0,
+                "semantic_scholar_min_delay_seconds": 0,
+            },
+            clear=False,
+        ):
+            tool = SemanticScholarSearchTool()
+
+            with patch(
+                "app.tools.semantic_scholar.urllib.request.urlopen",
+                side_effect=[rate_limit_error, FakeResponse()],
+            ) as mocked_urlopen, patch("app.tools.semantic_scholar.time.sleep") as mocked_sleep:
+                notes = tool.search_papers("kv cache", max_results=1)
+
+        self.assertEqual(notes[0]["semantic_scholar_id"], "S2-1")
+        self.assertEqual(mocked_urlopen.call_count, 2)
+        mocked_sleep.assert_called_once_with(0.0)
 
     def test_arxiv_cooldown_persists_across_tool_instances(self):
         with TemporaryDirectory() as temp_dir, patch.dict(
             "app.tools.arxiv_search.config",
-            {"arxiv_state_path": f"{temp_dir}/arxiv_state.json"},
+            {
+                "arxiv_state_path": f"{temp_dir}/arxiv_state.json",
+                "arxiv_rate_limit_max_retries": 1,
+                "arxiv_rate_limit_retry_after_seconds": 0,
+            },
             clear=False,
         ):
             first = ArxivSearchTool(max_results=2)
-            with patch.object(first.client, "results", side_effect=RuntimeError("HTTP 429 Too Many Requests")):
+            with patch.object(first.client, "results", side_effect=RuntimeError("HTTP 429 Too Many Requests")), patch(
+                "app.tools.arxiv_search.time.sleep"
+            ):
                 first.search_papers("kv cache")
 
             state_path = Path(temp_dir) / "arxiv_state.json"

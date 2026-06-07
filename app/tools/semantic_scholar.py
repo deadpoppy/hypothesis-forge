@@ -40,8 +40,8 @@ class SemanticScholarSearchTool:
         self.timeout_seconds = float(timeout_seconds or config.get("semantic_scholar_timeout_seconds", 8))
         self.api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY") or config.get("semantic_scholar_api_key")
         self.min_delay_seconds = float(config.get("semantic_scholar_min_delay_seconds", 2.0))
-        self.max_retries = int(config.get("semantic_scholar_max_retries", 2))
-        self.retry_after_seconds = float(config.get("semantic_scholar_retry_after_seconds", 8.0))
+        self.max_retries = int(config.get("semantic_scholar_max_retries", 1))
+        self.retry_after_seconds = float(config.get("semantic_scholar_retry_after_seconds", 20.0))
         self.cooldown_seconds = float(config.get("semantic_scholar_cooldown_seconds", 600.0))
         self._lock = threading.Lock()
         self._last_call_at = 0.0

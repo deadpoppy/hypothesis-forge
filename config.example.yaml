@@ -62,8 +62,10 @@ arxiv_state_path: ".cache/arxiv_search_state.json"
 semantic_scholar_api_key: null
 semantic_scholar_timeout_seconds: 8
 semantic_scholar_min_delay_seconds: 2.0
-semantic_scholar_max_retries: 2
-semantic_scholar_retry_after_seconds: 8.0
+semantic_scholar_max_retries: 1
+semantic_scholar_retry_after_seconds: 20.0
+arxiv_rate_limit_max_retries: 1
+arxiv_rate_limit_retry_after_seconds: 20.0
 arxiv_failure_cooldown_seconds: 900
 arxiv_max_consecutive_failures: 3
 
