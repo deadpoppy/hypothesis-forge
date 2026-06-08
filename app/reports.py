@@ -80,12 +80,20 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
             parts.append(_line(f"Focus: {hypothesis.get('focus_area', '')}"))
             if hypothesis.get("primary_bottleneck"):
                 parts.append(_line(f"Bottleneck: `{hypothesis.get('primary_bottleneck')}`"))
+            if hypothesis.get("problem_framing"):
+                parts.append(_line(f"Problem framing: {hypothesis.get('problem_framing')}"))
+            if hypothesis.get("central_insight"):
+                parts.append(_line(f"Central insight: {hypothesis.get('central_insight')}"))
+            if hypothesis.get("theoretical_story"):
+                parts.append(_line(f"Story: {hypothesis.get('theoretical_story')}"))
             if hypothesis.get("origin") == "evolution":
                 parts.append(_line(f"Parents: `{hypothesis.get('parent_ids', [])}`"))
                 if hypothesis.get("mutation_operator"):
                     parts.append(_line(f"Mutation operator: `{hypothesis.get('mutation_operator')}`"))
                 if hypothesis.get("evolution_delta"):
                     parts.append(_line(f"Evolution delta: {hypothesis.get('evolution_delta')}"))
+            if hypothesis.get("why_not_simple_combination"):
+                parts.append(_line(f"Why not a simple combination: {hypothesis.get('why_not_simple_combination')}"))
             parts.append(_line(hypothesis.get("text", "")))
             parts.append(_line(f"Scores: `{hypothesis.get('scores', {})}`"))
             prior_art_audit = hypothesis.get("prior_art_audit", {})
@@ -166,10 +174,25 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
 
         meta_review = cycle.get("meta_review", {})
         overview = meta_review.get("research_overview", {}) if isinstance(meta_review, dict) else {}
+        story_guidance = meta_review.get("story_guidance", {}) if isinstance(meta_review, dict) else {}
         parts.append(_line("### Meta-Review"))
         parts.append(_line("Critique:"))
         parts.append(_format_list(meta_review.get("meta_review_critique", []) if isinstance(meta_review, dict) else []))
+        if isinstance(story_guidance, dict) and story_guidance:
+            parts.append(_line(f"Frontier story: {story_guidance.get('frontier_story', '')}"))
+            parts.append(_line("Method-stacking patterns:"))
+            parts.append(_format_list(story_guidance.get("method_stacking_patterns", [])))
+            parts.append(_line("Theory gaps:"))
+            parts.append(_format_list(story_guidance.get("theory_gaps", [])))
         parts.append(_line(f"Overview: {overview.get('summary', '')}"))
+        if overview.get("frontier_storyline"):
+            parts.append(_line(f"Frontier storyline: {overview.get('frontier_storyline')}"))
+        if overview.get("anti_combination_guidance"):
+            parts.append(_line("Anti-combination guidance:"))
+            parts.append(_format_list(overview.get("anti_combination_guidance", [])))
+        if overview.get("theory_gaps"):
+            parts.append(_line("Theory gaps:"))
+            parts.append(_format_list(overview.get("theory_gaps", [])))
         parts.append(_line("Suggested next steps:"))
         parts.append(_format_list(overview.get("suggested_next_steps", [])))
         parts.append(_line("Suggested experiments:"))

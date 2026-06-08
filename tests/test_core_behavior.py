@@ -31,7 +31,8 @@ from app.literature import LiteratureCache, LiteratureSearchService, dedupe_note
 import app.llm as llm_module
 from app.llm import call_llm
 from app.models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan
-from app.prompts import _serialize_literature, build_evolution_messages
+from app.prompts import _serialize_literature, build_evolution_messages, build_generation_messages, build_meta_review_messages
+from app.reports import build_markdown_report
 from app.tools.arxiv_search import ArxivSearchTool
 from app.tools.semantic_scholar import SemanticScholarSearchTool
 from app.trajectory import analyze_run_payload
@@ -688,6 +689,7 @@ llm_base_url_fallbacks: []
         hypothesis = Hypothesis("H1", "Title", "Hypothesis text")
         payload = {
             "correctness_score": 4,
+            "story_coherence_score": 5,
             "short_summary": "Specialized summary",
             "deep_verification": {
                 "invalidating_assumptions": ["Bad assumption"],
@@ -701,14 +703,23 @@ llm_base_url_fallbacks: []
                 "failure_scenarios": ["Fails under C"],
                 "protocol_risks": ["Risk D"],
             },
+            "story_review": {
+                "combination_risk": "high",
+                "theory_gap": ["Add a sharper causal claim"],
+                "story_preserving_repair": ["Reframe around one mechanism"],
+            },
         }
 
         ReflectionAgent()._apply_specialized_review(hypothesis, payload)
 
         self.assertIn("Bad assumption", hypothesis.failure_modes)
         self.assertIn("Fails under C", hypothesis.failure_modes)
+        self.assertIn("Story review flagged high method-stacking risk.", hypothesis.failure_modes)
         self.assertIn("Observed A", hypothesis.supporting_observations)
         self.assertIn("Missing B", hypothesis.contradicting_observations)
+        self.assertIn("Add a sharper causal claim", hypothesis.improvement_actions)
+        self.assertIn("Reframe around one mechanism", hypothesis.improvement_actions)
+        self.assertEqual(hypothesis.scores["story_coherence"], 5.0)
         self.assertEqual(hypothesis.specialized_reviews[-1]["short_summary"], "Specialized summary")
 
     def test_evolution_infers_parent_ids_when_model_omits_them(self):
@@ -913,7 +924,46 @@ llm_base_url_fallbacks: []
         self.assertIn("credible improvement over the source hypotheses", prompt)
         self.assertIn("rank above at least one of its provided source hypotheses", prompt)
         self.assertIn("not just a safe refinement", prompt)
+        self.assertIn("problem framing", prompt)
+        self.assertIn("theoretical story", prompt)
+        self.assertIn("simple method combination", prompt)
         self.assertNotIn("why_better_than_parents", prompt)
+
+    def test_generation_prompt_requires_story_skeleton(self):
+        messages = build_generation_messages(
+            research_goal="goal",
+            research_plan={},
+            context_hypotheses=[],
+            literature_notes=[],
+            meta_feedback={},
+            research_overview={},
+            trajectory_state={},
+            num_hypotheses=2,
+            uncovered_focus_areas=[],
+            overexplored_areas=[],
+        )
+        prompt = messages[-1]["content"]
+
+        self.assertIn("central insight", prompt)
+        self.assertIn("theoretical story", prompt)
+        self.assertIn("simple combination", prompt)
+
+    def test_meta_review_prompt_requests_story_guidance(self):
+        messages = build_meta_review_messages(
+            research_goal="goal",
+            research_plan={},
+            ranked_hypotheses=[],
+            recent_reviews=[],
+            tournament_history=[],
+            proximity_summary={},
+            trajectory_state={},
+            literature_notes=[],
+        )
+        prompt = messages[-1]["content"]
+
+        self.assertIn("story_guidance", prompt)
+        self.assertIn("method-stacking patterns", prompt)
+        self.assertIn("frontier_storyline", prompt)
 
     def test_full_review_reuses_seeded_and_parent_literature_for_evolved_hypotheses(self):
         goal = ResearchGoal("goal", max_literature_results=3, reflection_temperature=0.3)
@@ -996,6 +1046,64 @@ llm_base_url_fallbacks: []
 
         self.assertEqual(mocked_search.call_count, 0)
         self.assertEqual(result.data["literature_reuse_count"], 3)
+
+    def test_markdown_report_surfaces_story_fields(self):
+        report = build_markdown_report(
+            [
+                {
+                    "iteration": 1,
+                    "cycle_duration": 0.2,
+                    "statistics_before": {},
+                    "statistics_after": {},
+                    "research_plan": {
+                        "objective": "Goal",
+                        "domain": "Domain",
+                        "focus_areas": ["Area"],
+                        "success_criteria": ["Need story"],
+                    },
+                    "steps": {
+                        "ranking_final": {
+                            "hypotheses": [
+                                {
+                                    "id": "H1",
+                                    "title": "Story Idea",
+                                    "elo_score": 1300,
+                                    "review_verdict": "advance",
+                                    "focus_area": "Area",
+                                    "primary_bottleneck": "latency",
+                                    "problem_framing": "A hidden tension exists",
+                                    "central_insight": "One mechanism dominates",
+                                    "theoretical_story": "The story explains the gain",
+                                    "why_not_simple_combination": "It is one causal chain",
+                                    "text": "Text",
+                                    "scores": {},
+                                }
+                            ]
+                        }
+                    },
+                    "meta_review": {
+                        "meta_review_critique": ["Critique"],
+                        "story_guidance": {
+                            "frontier_story": "Tell a cleaner story",
+                            "method_stacking_patterns": ["Avoid stacks"],
+                            "theory_gaps": ["Need sharper theory"],
+                        },
+                        "research_overview": {
+                            "summary": "Overview",
+                            "frontier_storyline": "One storyline",
+                            "anti_combination_guidance": ["Do not stack methods"],
+                            "theory_gaps": ["Need a core claim"],
+                            "suggested_next_steps": [],
+                            "suggested_experiments": [],
+                        },
+                    },
+                }
+            ]
+        )
+
+        self.assertIn("Problem framing:", report)
+        self.assertIn("Frontier story:", report)
+        self.assertIn("Frontier storyline:", report)
 
     def test_prior_art_check_skips_unchanged_idea_signature(self):
         goal = ResearchGoal("goal", enable_prior_art_check=True)

@@ -429,6 +429,10 @@ class Hypothesis:
     primary_bottleneck: str = ""
     rationale: str = ""
     mechanism: str = ""
+    problem_framing: str = ""
+    central_insight: str = ""
+    theoretical_story: str = ""
+    why_not_simple_combination: str = ""
     generation_strategy: str = "generation"
     mutation_operator: str = ""
     evolution_delta: str = ""
@@ -473,6 +477,9 @@ class Hypothesis:
             "testability": "testability_score",
             "feasibility": "feasibility_score",
             "correctness": "correctness_score",
+            "story_coherence": "story_coherence_score",
+            "theoretical_depth": "theoretical_depth_score",
+            "non_combination": "non_combination_score",
         }
 
         for key, source_key in score_mapping.items():
@@ -498,6 +505,10 @@ class Hypothesis:
         comments = coerce_string_list(review.get("strengths", []))
         comments.extend(coerce_string_list(review.get("weaknesses", [])))
         comments.extend(coerce_string_list(review.get("improvement_actions", [])))
+        story_diagnosis = review.get("story_diagnosis") if isinstance(review.get("story_diagnosis"), dict) else {}
+        combination_risk = str(story_diagnosis.get("combination_risk") or "").strip().lower()
+        if combination_risk in {"medium", "high"}:
+            comments.append(f"{stage_label}: {combination_risk} method-stacking risk.")
         if summary:
             comments.append(f"{stage_label}: {summary}")
         self.review_comments = _dedupe(self.review_comments + comments)
@@ -514,7 +525,10 @@ class Hypothesis:
             self.contradicting_observations + coerce_string_list(review.get("contradicting_observations", []))
         )
         self.improvement_actions = _dedupe(
-            self.improvement_actions + coerce_string_list(review.get("improvement_actions", []))
+            self.improvement_actions
+            + coerce_string_list(review.get("improvement_actions", []))
+            + coerce_string_list(story_diagnosis.get("missing_theory", []))
+            + coerce_string_list(story_diagnosis.get("repair_to_story", []))
         )
         self.references = _dedupe(self.references + coerce_string_list(review.get("references", [])))
 
@@ -527,6 +541,10 @@ class Hypothesis:
             "title": self.title,
             "focus_area": self.focus_area,
             "primary_bottleneck": self.primary_bottleneck,
+            "problem_framing": self.problem_framing,
+            "central_insight": self.central_insight,
+            "theoretical_story": self.theoretical_story,
+            "why_not_simple_combination": self.why_not_simple_combination,
             "summary": self.review_summary or self.text,
             "elo_score": round(self.elo_score, 2),
             "scores": self.scores,
@@ -545,6 +563,10 @@ class Hypothesis:
             "primary_bottleneck": self.primary_bottleneck,
             "rationale": self.rationale,
             "mechanism": self.mechanism,
+            "problem_framing": self.problem_framing,
+            "central_insight": self.central_insight,
+            "theoretical_story": self.theoretical_story,
+            "why_not_simple_combination": self.why_not_simple_combination,
             "generation_strategy": self.generation_strategy,
             "mutation_operator": self.mutation_operator,
             "evolution_delta": self.evolution_delta,
@@ -574,6 +596,10 @@ class Hypothesis:
             "primary_bottleneck": self.primary_bottleneck,
             "rationale": self.rationale,
             "mechanism": self.mechanism,
+            "problem_framing": self.problem_framing,
+            "central_insight": self.central_insight,
+            "theoretical_story": self.theoretical_story,
+            "why_not_simple_combination": self.why_not_simple_combination,
             "generation_strategy": self.generation_strategy,
             "mutation_operator": self.mutation_operator,
             "evolution_delta": self.evolution_delta,
@@ -596,6 +622,10 @@ class Hypothesis:
             "primary_bottleneck": self.primary_bottleneck,
             "rationale": self.rationale,
             "mechanism": self.mechanism,
+            "problem_framing": self.problem_framing,
+            "central_insight": self.central_insight,
+            "theoretical_story": self.theoretical_story,
+            "why_not_simple_combination": self.why_not_simple_combination,
             "generation_strategy": self.generation_strategy,
             "mutation_operator": self.mutation_operator,
             "evolution_delta": self.evolution_delta,

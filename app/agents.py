@@ -50,12 +50,35 @@ def _compose_hypothesis_text(payload: Dict[str, Any]) -> str:
         or ""
     )
     parts = [str(core_text).strip()]
+    problem_framing = str(payload.get("problem_framing") or payload.get("problem_frame") or "").strip()
+    central_insight = str(payload.get("central_insight") or payload.get("key_insight") or "").strip()
+    theoretical_story = str(
+        payload.get("theoretical_story")
+        or payload.get("causal_story")
+        or payload.get("story")
+        or payload.get("storyline")
+        or ""
+    ).strip()
     mechanism = str(payload.get("mechanism", "")).strip()
     novelty = str(payload.get("novelty_rationale") or payload.get("rationale") or "").strip()
+    anti_combination = str(
+        payload.get("why_not_simple_combination")
+        or payload.get("why_not_just_combination")
+        or payload.get("not_just_combination")
+        or ""
+    ).strip()
+    if problem_framing:
+        parts.append(f"Problem framing: {problem_framing}")
+    if central_insight:
+        parts.append(f"Central insight: {central_insight}")
+    if theoretical_story:
+        parts.append(f"Theoretical story: {theoretical_story}")
     if mechanism:
         parts.append(f"Mechanism: {mechanism}")
     if novelty:
         parts.append(f"Novelty rationale: {novelty}")
+    if anti_combination:
+        parts.append(f"Why not simple combination: {anti_combination}")
     return "\n".join(part for part in parts if part)
 
 
@@ -68,6 +91,11 @@ def _build_review_artifact(hypothesis: Hypothesis) -> Dict[str, Any]:
         "id": hypothesis.hypothesis_id,
         "title": hypothesis.title,
         "summary": hypothesis.review_summary,
+        "problem_framing": hypothesis.problem_framing,
+        "central_insight": hypothesis.central_insight,
+        "theoretical_story": hypothesis.theoretical_story,
+        "mechanism": hypothesis.mechanism,
+        "why_not_simple_combination": hypothesis.why_not_simple_combination,
         "scores": hypothesis.scores,
         "verdict": hypothesis.review_verdict,
         "weaknesses": hypothesis.failure_modes[:4] + hypothesis.improvement_actions[:4],
@@ -808,6 +836,21 @@ class GenerationAgent(LiteratureMixin):
             primary_bottleneck=str(payload.get("primary_bottleneck", "")).strip(),
             rationale=str(payload.get("novelty_rationale") or payload.get("rationale") or "").strip(),
             mechanism=str(payload.get("mechanism", "")).strip(),
+            problem_framing=str(payload.get("problem_framing") or payload.get("problem_frame") or "").strip(),
+            central_insight=str(payload.get("central_insight") or payload.get("key_insight") or "").strip(),
+            theoretical_story=str(
+                payload.get("theoretical_story")
+                or payload.get("causal_story")
+                or payload.get("story")
+                or payload.get("storyline")
+                or ""
+            ).strip(),
+            why_not_simple_combination=str(
+                payload.get("why_not_simple_combination")
+                or payload.get("why_not_just_combination")
+                or payload.get("not_just_combination")
+                or ""
+            ).strip(),
             generation_strategy=str(payload.get("generation_strategy", "generation")).strip(),
             mutation_operator=str(payload.get("mutation_operator") or "").strip(),
             evolution_delta=str(payload.get("delta_from_parents") or payload.get("diversity_reason") or "").strip(),
@@ -1230,6 +1273,10 @@ class PriorArtAgent(LiteratureMixin):
             hypothesis.focus_area,
             hypothesis.primary_bottleneck,
             hypothesis.mechanism,
+            hypothesis.problem_framing,
+            hypothesis.central_insight,
+            hypothesis.theoretical_story,
+            hypothesis.why_not_simple_combination,
             hypothesis.rationale,
             " ".join(hypothesis.predictions),
             " ".join(hypothesis.validation_experiments),
@@ -1379,6 +1426,29 @@ class PriorArtAgent(LiteratureMixin):
         mechanism = str(revised.get("mechanism") or "").strip()
         if mechanism:
             hypothesis.mechanism = mechanism
+        problem_framing = str(revised.get("problem_framing") or revised.get("problem_frame") or "").strip()
+        if problem_framing:
+            hypothesis.problem_framing = problem_framing
+        central_insight = str(revised.get("central_insight") or revised.get("key_insight") or "").strip()
+        if central_insight:
+            hypothesis.central_insight = central_insight
+        theoretical_story = str(
+            revised.get("theoretical_story")
+            or revised.get("causal_story")
+            or revised.get("story")
+            or revised.get("storyline")
+            or ""
+        ).strip()
+        if theoretical_story:
+            hypothesis.theoretical_story = theoretical_story
+        anti_combination = str(
+            revised.get("why_not_simple_combination")
+            or revised.get("why_not_just_combination")
+            or revised.get("not_just_combination")
+            or ""
+        ).strip()
+        if anti_combination:
+            hypothesis.why_not_simple_combination = anti_combination
         rationale = str(revised.get("novelty_rationale") or revised.get("rationale") or "").strip()
         if rationale:
             hypothesis.rationale = rationale
@@ -1644,6 +1714,7 @@ class ReflectionAgent(LiteratureMixin):
         deep_verification = _coerce_mapping(payload.get("deep_verification"), {})
         observation_review = _coerce_mapping(payload.get("observation_review"), {})
         simulation_review = _coerce_mapping(payload.get("simulation_review"), {})
+        story_review = _coerce_mapping(payload.get("story_review"), {})
 
         hypothesis.failure_modes = dedupe_preserve_order(
             hypothesis.failure_modes
@@ -1651,6 +1722,11 @@ class ReflectionAgent(LiteratureMixin):
             + coerce_string_list(simulation_review.get("failure_scenarios", []))
             + coerce_string_list(simulation_review.get("protocol_risks", []))
         )
+        combination_risk = str(story_review.get("combination_risk") or "").strip().lower()
+        if combination_risk in {"medium", "high"}:
+            hypothesis.failure_modes = dedupe_preserve_order(
+                hypothesis.failure_modes + [f"Story review flagged {combination_risk} method-stacking risk."]
+            )
         hypothesis.supporting_observations = dedupe_preserve_order(
             hypothesis.supporting_observations + coerce_string_list(observation_review.get("explained_observations", []))
         )
@@ -1662,6 +1738,8 @@ class ReflectionAgent(LiteratureMixin):
             hypothesis.improvement_actions
             + coerce_string_list(deep_verification.get("non_fundamental_repairs", []))
             + coerce_string_list(observation_review.get("needed_observations", []))
+            + coerce_string_list(story_review.get("theory_gap", []))
+            + coerce_string_list(story_review.get("story_preserving_repair", []))
         )
         hypothesis.specialized_reviews.append(payload)
 
@@ -1670,6 +1748,9 @@ class ReflectionAgent(LiteratureMixin):
             "correctness_score": hypothesis.scores.get("correctness", hypothesis.scores.get("alignment", 3)),
             "plausibility_score": hypothesis.scores.get("plausibility", hypothesis.scores.get("feasibility", 3)),
             "testability_score": hypothesis.scores.get("testability", 3),
+            "story_coherence_score": hypothesis.scores.get("story_coherence", 3),
+            "theoretical_depth_score": hypothesis.scores.get("theoretical_depth", 3),
+            "non_combination_score": hypothesis.scores.get("non_combination", 3),
             "verdict": hypothesis.review_verdict or "revise",
             "short_summary": hypothesis.review_summary or hypothesis.text[:220],
             "deep_verification": {
@@ -1687,6 +1768,12 @@ class ReflectionAgent(LiteratureMixin):
                 "failure_scenarios": hypothesis.failure_modes[:3],
                 "protocol_risks": [],
             },
+            "story_review": {
+                "core_story": hypothesis.theoretical_story or hypothesis.mechanism,
+                "combination_risk": "medium" if hypothesis.generation_strategy == "combination" else "low",
+                "theory_gap": [],
+                "story_preserving_repair": ["Retry specialized story review with stronger literature grounding."],
+            },
             "failure_modes": hypothesis.failure_modes[:4],
             "validation_experiments": hypothesis.validation_experiments[:4],
             "improvement_actions": ["Manual deep verification is needed because automatic specialized review failed."],
@@ -1702,11 +1789,20 @@ class ReflectionAgent(LiteratureMixin):
             "feasibility_score": 3,
             "correctness_score": 3,
             "testability_score": 3,
+            "story_coherence_score": 3,
+            "theoretical_depth_score": 3,
+            "non_combination_score": 3,
             "verdict": "revise",
             "short_summary": summary,
             "strengths": ["Fallback review used because the structured LLM review failed."],
             "weaknesses": ["Needs manual inspection because automatic review failed."],
             "critical_assumptions": hypothesis.key_assumptions[:3],
+            "story_diagnosis": {
+                "core_story": hypothesis.theoretical_story or hypothesis.mechanism,
+                "combination_risk": "medium" if hypothesis.generation_strategy == "combination" else "low",
+                "missing_theory": [],
+                "repair_to_story": ["Retry review to diagnose whether the hypothesis has a coherent paper story."],
+            },
             "supporting_observations": [],
             "contradicting_observations": [],
             "failure_modes": [],
@@ -2355,7 +2451,14 @@ class RankingAgent:
             "plausibility": hypothesis.scores.get("plausibility", hypothesis.scores.get("feasibility", 0.0)),
             "testability": hypothesis.scores.get("testability", 0.0),
         }
-        return sum(score_map.get(metric, 0.0) * weight for metric, weight in weights.items())
+        weighted = sum(score_map.get(metric, 0.0) * weight for metric, weight in weights.items())
+        story_scores = [
+            hypothesis.scores.get("story_coherence", 0.0),
+            hypothesis.scores.get("theoretical_depth", 0.0),
+            hypothesis.scores.get("non_combination", 0.0),
+        ]
+        story_bonus = (sum(score for score in story_scores if score) / (5.0 * len(story_scores))) * 0.75 if any(story_scores) else 0.0
+        return weighted + story_bonus
 
     def _heuristic_decision(self, hypothesis_a: Hypothesis, hypothesis_b: Hypothesis, research_plan: ResearchPlan) -> Dict[str, Any]:
         score_a = self._weighted_score(hypothesis_a, research_plan)
@@ -2523,6 +2626,9 @@ class EvolutionAgent(LiteratureMixin):
                     [
                         str(item.get("title") or ""),
                         str(item.get("core_hypothesis") or item.get("hypothesis") or item.get("description") or ""),
+                        str(item.get("problem_framing") or item.get("problem_frame") or ""),
+                        str(item.get("central_insight") or item.get("key_insight") or ""),
+                        str(item.get("theoretical_story") or item.get("causal_story") or item.get("story") or ""),
                         str(item.get("mechanism") or ""),
                         str(item.get("novelty_rationale") or item.get("rationale") or ""),
                     ]
@@ -2544,6 +2650,21 @@ class EvolutionAgent(LiteratureMixin):
                 primary_bottleneck=str(item.get("primary_bottleneck", "")).strip(),
                 rationale=str(item.get("novelty_rationale") or item.get("rationale") or "").strip(),
                 mechanism=str(item.get("mechanism", "")).strip(),
+                problem_framing=str(item.get("problem_framing") or item.get("problem_frame") or "").strip(),
+                central_insight=str(item.get("central_insight") or item.get("key_insight") or "").strip(),
+                theoretical_story=str(
+                    item.get("theoretical_story")
+                    or item.get("causal_story")
+                    or item.get("story")
+                    or item.get("storyline")
+                    or ""
+                ).strip(),
+                why_not_simple_combination=str(
+                    item.get("why_not_simple_combination")
+                    or item.get("why_not_just_combination")
+                    or item.get("not_just_combination")
+                    or ""
+                ).strip(),
                 generation_strategy=str(item.get("generation_strategy", "combination")).strip(),
                 mutation_operator=str(item.get("mutation_operator") or item.get("generation_strategy") or "combination").strip(),
                 evolution_delta=str(item.get("delta_from_parents") or item.get("diversity_reason") or "").strip(),
@@ -2617,6 +2738,21 @@ class EvolutionAgent(LiteratureMixin):
                     primary_bottleneck=str(item.get("primary_bottleneck", "")).strip(),
                     rationale=str(item.get("novelty_rationale") or item.get("rationale") or "").strip(),
                     mechanism=str(item.get("mechanism", "")).strip(),
+                    problem_framing=str(item.get("problem_framing") or item.get("problem_frame") or "").strip(),
+                    central_insight=str(item.get("central_insight") or item.get("key_insight") or "").strip(),
+                    theoretical_story=str(
+                        item.get("theoretical_story")
+                        or item.get("causal_story")
+                        or item.get("story")
+                        or item.get("storyline")
+                        or ""
+                    ).strip(),
+                    why_not_simple_combination=str(
+                        item.get("why_not_simple_combination")
+                        or item.get("why_not_just_combination")
+                        or item.get("not_just_combination")
+                        or ""
+                    ).strip(),
                     generation_strategy=str(item.get("generation_strategy", "combination")).strip(),
                     mutation_operator=str(item.get("mutation_operator") or item.get("generation_strategy") or "combination").strip(),
                     evolution_delta=str(item.get("delta_from_parents") or item.get("diversity_reason") or "").strip(),
@@ -2763,16 +2899,29 @@ class MetaReviewAgent(LiteratureMixin):
             errors.append(str(exc))
 
         critique = dedupe_preserve_order(payload.get("meta_review_critique", []))
+        raw_story_guidance = payload.get("story_guidance", {})
+        story_guidance = raw_story_guidance if isinstance(raw_story_guidance, dict) else {}
+        story_guidance = {
+            "frontier_story": str(story_guidance.get("frontier_story") or "").strip(),
+            "method_stacking_patterns": dedupe_preserve_order(story_guidance.get("method_stacking_patterns", [])),
+            "theory_gaps": dedupe_preserve_order(story_guidance.get("theory_gaps", [])),
+            "next_generation_story_targets": dedupe_preserve_order(story_guidance.get("next_generation_story_targets", [])),
+            "combination_policy": str(story_guidance.get("combination_policy") or "").strip(),
+        }
         overview = payload.get("research_overview", {})
         if isinstance(overview, dict):
             top_titles = []
             for hypothesis in ranked[:3]:
                 top_titles.append(hypothesis.title)
             overview.setdefault("top_ranked_hypotheses", top_titles)
+            overview.setdefault("frontier_storyline", "")
+            overview.setdefault("anti_combination_guidance", [])
+            overview.setdefault("theory_gaps", [])
 
         context.meta_review_feedback.append(
             {
                 "meta_review_critique": critique,
+                "story_guidance": story_guidance,
                 "generation_guidance": dedupe_preserve_order(payload.get("generation_guidance", [])),
                 "reflection_guidance": dedupe_preserve_order(payload.get("reflection_guidance", [])),
                 "ranking_guidance": dedupe_preserve_order(payload.get("ranking_guidance", [])),
@@ -2808,12 +2957,22 @@ class MetaReviewAgent(LiteratureMixin):
             critique.append("The current frontier looks reasonably healthy; focus on sharper experiments and differentiation.")
         return {
             "meta_review_critique": critique,
+            "story_guidance": {
+                "frontier_story": "No reliable LLM meta-review was available; preserve only hypotheses with a clear problem-to-mechanism story.",
+                "method_stacking_patterns": ["Watch for proposals that only combine named techniques without a unifying causal claim."],
+                "theory_gaps": ["Clarify the central insight and falsifiable prediction for the next generation batch."],
+                "next_generation_story_targets": ["Generate hypotheses from a problem tension first, then derive the mechanism."],
+                "combination_policy": "Combination is acceptable only when one causal story explains why the ingredients must interact.",
+            },
             "generation_guidance": ["Use stronger literature grounding and avoid near-duplicate proposals."],
-            "reflection_guidance": ["Be explicit about failure modes and falsifiable experiments."],
+            "reflection_guidance": ["Be explicit about failure modes, falsifiable experiments, and story coherence."],
             "ranking_guidance": ["Prefer direct pairwise comparisons among similar hypotheses and newer challengers."],
             "trajectory_state": trajectory_state,
             "research_overview": {
                 "summary": "Fallback meta-review generated locally.",
+                "frontier_storyline": "",
+                "anti_combination_guidance": ["Do not advance ideas whose novelty is only method aggregation."],
+                "theory_gaps": ["Need explicit central insight and causal story."],
                 "priority_areas": [hypothesis.focus_area for hypothesis in ranked[:3] if hypothesis.focus_area],
                 "top_ranked_hypotheses": [hypothesis.title for hypothesis in ranked[:3]],
                 "suggested_next_steps": dedupe_preserve_order(

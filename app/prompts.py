@@ -43,6 +43,7 @@ def _serialize_hypotheses(hypotheses: List[Dict[str, Any]], limit: int = 8) -> s
 def _serialize_feedback(meta_feedback: Dict[str, Any], research_overview: Dict[str, Any], trajectory_state: Dict[str, Any] | None = None) -> str:
     payload = {
         "meta_review_critique": meta_feedback.get("meta_review_critique", []),
+        "story_guidance": meta_feedback.get("story_guidance", {}),
         "generation_guidance": meta_feedback.get("generation_guidance", []),
         "reflection_guidance": meta_feedback.get("reflection_guidance", []),
         "ranking_guidance": meta_feedback.get("ranking_guidance", []),
@@ -67,6 +68,7 @@ Please infer and structure:
 - the likely domain
 - focus areas
 - key questions
+- conceptual tensions or under-explained phenomena that could anchor a paper story, captured in key_questions or notes
 - success criteria
 - evaluation criteria weights shared across all later stages
 - constraints and things to avoid
@@ -216,6 +218,12 @@ Overexplored clusters to avoid repeating unless the mechanism is clearly differe
 Requirements:
 - Produce genuinely distinct hypotheses, not paraphrases.
 - Each hypothesis must contain a mechanism or causal story.
+- Each hypothesis must have one central insight that could become the spine of a paper, not a list of borrowed modules.
+- Start from a problem tension or unexplained phenomenon, then derive the method from that tension.
+- Do not reduce the idea to a simple combination of methods without a single causal story.
+- If multiple methods are combined, explain the unifying causal reason they belong together. A method list such as "use A plus B plus C" without a single story is invalid.
+- The theoretical story should make at least one falsifiable differential prediction: what should happen if the story is correct, and what should fail if it is not.
+- Prefer simple conceptual moves with deep consequences over complex stacks of tricks.
 - Each hypothesis must include an actionable validation path.
 - Prefer ideas that are novel but still testable.
 - Treat the returned set as a portfolio. Avoid collapsing into one mechanism family.
@@ -240,8 +248,12 @@ Required JSON schema:
       "title": "string",
       "focus_area": "string",
       "primary_bottleneck": "compute|memory bandwidth|latency|cache pressure|verification overhead|other",
+      "problem_framing": "string",
+      "central_insight": "string",
+      "theoretical_story": "string",
       "core_hypothesis": "string",
       "mechanism": "string",
+      "why_not_simple_combination": "string",
       "novelty_rationale": "string",
       "generation_strategy": "literature_grounding|debate|decomposition|expansion|other",
       "key_assumptions": ["string"],
@@ -299,6 +311,8 @@ Overexplored clusters to avoid repeating unless the mechanism is clearly differe
 Requirements:
 - Return exactly {missing_hypotheses} additional hypotheses.
 - Do not repeat titles, focus areas, or mechanisms that already appear in the accepted set unless the causal story is materially different.
+- Each additional hypothesis must expose a problem framing, a central insight, and a theoretical story. Do not use refill slots for bare method combinations.
+- If it combines existing methods, the output must explain the single causal mechanism that makes the combination necessary.
 - Prefer uncovered focus areas first, then use a clearly different mechanism family.
 - Use each remaining slot to cover a different focus area or bottleneck whenever possible.
 - Returning a single hypothesis object instead of a `hypotheses` array is invalid.
@@ -311,8 +325,12 @@ Required JSON schema:
       "title": "string",
       "focus_area": "string",
       "primary_bottleneck": "compute|memory bandwidth|latency|cache pressure|verification overhead|other",
+      "problem_framing": "string",
+      "central_insight": "string",
+      "theoretical_story": "string",
       "core_hypothesis": "string",
       "mechanism": "string",
+      "why_not_simple_combination": "string",
       "novelty_rationale": "string",
       "generation_strategy": "literature_grounding|debate|decomposition|expansion|other",
       "key_assumptions": ["string"],
@@ -357,7 +375,11 @@ Judge the hypothesis using the shared evaluation contract:
 - novelty
 - plausibility
 - testability
+- story coherence: whether the idea has a single problem-to-mechanism-to-prediction narrative
+- theoretical depth: whether it explains why the method should work beyond empirical trial-and-error
+- non-combination quality: whether any combined ingredients are necessary consequences of the story rather than a method stack
 - use "reject" only for ideas that are out of scope, fundamentally invalid, or not worth keeping in the tournament pool
+- use "revise" for a plausible idea that is only a combination of known methods until it gains a sharper theory/story
 
 Required JSON schema:
 {{
@@ -366,11 +388,20 @@ Required JSON schema:
   "plausibility_score": 1,
   "feasibility_score": 1,
   "testability_score": 1,
+  "story_coherence_score": 1,
+  "theoretical_depth_score": 1,
+  "non_combination_score": 1,
   "verdict": "advance|revise|reject",
   "short_summary": "string",
   "strengths": ["string"],
   "weaknesses": ["string"],
   "critical_assumptions": ["string"],
+  "story_diagnosis": {{
+    "core_story": "string",
+    "combination_risk": "low|medium|high",
+    "missing_theory": ["string"],
+    "repair_to_story": ["string"]
+  }},
   "improvement_actions": ["string"]
 }}
 """
@@ -391,6 +422,7 @@ def build_full_review_messages(
     prompt = f"""
 Perform a full review of this hypothesis using the literature notes as external grounding.
 Be concrete about support, contradictions, failure modes, and experiments.
+Also judge whether the hypothesis has a coherent paper story rather than a method-stack novelty claim.
 
 Research goal:
 {research_goal}
@@ -418,11 +450,20 @@ Required JSON schema:
   "feasibility_score": 1,
   "correctness_score": 1,
   "testability_score": 1,
+  "story_coherence_score": 1,
+  "theoretical_depth_score": 1,
+  "non_combination_score": 1,
   "verdict": "advance|revise|reject",
   "short_summary": "string",
   "strengths": ["string"],
   "weaknesses": ["string"],
   "critical_assumptions": ["string"],
+  "story_diagnosis": {{
+    "core_story": "string",
+    "combination_risk": "low|medium|high",
+    "missing_theory": ["string"],
+    "repair_to_story": ["string"]
+  }},
   "supporting_observations": ["string"],
   "contradicting_observations": ["string"],
   "failure_modes": ["string"],
@@ -451,6 +492,7 @@ Cover three review types:
 1. Deep verification: decompose assumptions into sub-assumptions and identify fundamental invalidating errors.
 2. Observation review: assess whether the hypothesis explains long-tail or under-explained observations in the literature.
 3. Simulation review: simulate the mechanism or proposed experiment step by step and summarize failure scenarios.
+4. Story review: assess whether the idea has a coherent theory/story, and whether any method combination is necessary rather than decorative.
 
 Research goal:
 {research_goal}
@@ -475,6 +517,9 @@ Required JSON schema:
   "correctness_score": 1,
   "plausibility_score": 1,
   "testability_score": 1,
+  "story_coherence_score": 1,
+  "theoretical_depth_score": 1,
+  "non_combination_score": 1,
   "verdict": "advance|revise|reject",
   "short_summary": "string",
   "deep_verification": {{
@@ -499,6 +544,12 @@ Required JSON schema:
     "simulation_trace": ["string"],
     "failure_scenarios": ["string"],
     "protocol_risks": ["string"]
+  }},
+  "story_review": {{
+    "core_story": "string",
+    "combination_risk": "low|medium|high",
+    "theory_gap": ["string"],
+    "story_preserving_repair": ["string"]
   }},
   "failure_modes": ["string"],
   "validation_experiments": ["string"],
@@ -568,8 +619,12 @@ Required JSON schema:
     "title": "string",
     "focus_area": "string",
     "primary_bottleneck": "compute|memory bandwidth|latency|cache pressure|verification overhead|other",
+    "problem_framing": "string",
+    "central_insight": "string",
+    "theoretical_story": "string",
     "core_hypothesis": "string",
     "mechanism": "string",
+    "why_not_simple_combination": "string",
     "novelty_rationale": "string",
     "key_assumptions": ["string"],
     "predictions": ["string"],
@@ -595,6 +650,7 @@ def build_ranking_messages(
     prompt = f"""
 Compare the two hypotheses and decide which should win this tournament match.
 Use pairwise scientific judgment. Do not simply add up any prior review scores. Those scores are only local signals and are not directly comparable across hypotheses.
+When the two hypotheses are otherwise close, prefer the one with the more coherent single story over the one that reads like a method stack.
 
 Comparison mode:
 {mode}
@@ -647,6 +703,7 @@ def build_ranking_reaudit_messages(
     prompt = f"""
 Re-audit this cached tournament decision from a different angle.
 Do not defer to the previous winner. Stress-test the previous winner, steelman the previous loser, and check whether novelty, feasibility, testability, or risk-aware utility was underweighted.
+Also revisit whether one side has the stronger paper story rather than just a stronger bundle of methods.
 
 Comparison mode:
 {mode}
@@ -705,6 +762,7 @@ def build_evolution_messages(
 Generate {num_hypotheses} new evolved hypotheses.
 Important: create new hypotheses only. Do not overwrite or rewrite existing ones.
 The goal is not merely to make variants. Each evolved hypothesis must be a credible improvement over the source hypotheses provided to you.
+Evolution should sharpen the story: a stronger child should have a clearer problem framing, a deeper central insight, or a more falsifiable theoretical story than its parents.
 
 Research goal:
 {research_goal}
@@ -731,15 +789,18 @@ Use at least one of these operator families where appropriate:
 - grounded enhancement
 - feasibility or coherence repair
 - inspiration from adjacent literature
-- combination
+- combination, but only as synthesis around one causal mechanism
 - simplification
 - divergence away from over-explored clusters
 - Treat evolution as improvement, not paraphrase: every evolved hypothesis should be expected to rank above at least one of its provided source hypotheses under the shared criteria.
 - Do not output a mutation that is only a narrower, more complex, or differently worded version of a parent unless it is clearly better.
+- Do not output a simple method combination of parents unless the child explains the single causal story that makes the merge necessary.
+- Do not output "parent A + parent B" unless the child explains the hidden reason those parents should be unified. The child must introduce a new story-level claim, not just inherit tools.
 - At least one evolved hypothesis should be an ambitious challenger intended to improve on the current top-ranked source, not just a safe refinement.
 - Prefer divergence or simplification when the current top hypotheses cluster around the same mechanism family.
 - Every evolved hypothesis must cite 1 or 2 `parent_ids` drawn from the provided source hypotheses. Do not leave `parent_ids` empty.
 - Make the mutation legible: describe the concrete delta from the parent idea instead of rewriting the same idea with new wording.
+- Make the theory delta legible: describe what problem framing, central insight, or causal story is improved relative to the parent.
 - At least one evolved hypothesis should deliberately widen the search frontier when overexplored areas are listed.
 - Use the batch as a portfolio: when generating 3 or more mutations, include a mix of repair/simplification and frontier-widening moves instead of only polishing the same family.
 - Prefer fixing a specific overhead, invalidating assumption, or experiment weakness that appears in the parent line.
@@ -757,8 +818,12 @@ Required JSON schema:
       "title": "string",
       "focus_area": "string",
       "primary_bottleneck": "compute|memory bandwidth|latency|cache pressure|verification overhead|other",
+      "problem_framing": "string",
+      "central_insight": "string",
+      "theoretical_story": "string",
       "core_hypothesis": "string",
       "mechanism": "string",
+      "why_not_simple_combination": "string",
       "novelty_rationale": "string",
       "generation_strategy": "grounded_enhancement|repair|inspiration|combination|simplification|divergence",
       "mutation_operator": "grounded_enhancement|repair|inspiration|combination|simplification|divergence",
@@ -826,6 +891,8 @@ Requirements:
 - Every hypothesis must cite 1 or 2 `parent_ids` drawn from the provided source hypotheses.
 - Do not repeat titles, mechanisms, or parent combinations that already appear in the accepted evolved set unless the mutation delta is materially different.
 - Every additional hypothesis must be a credible improvement over its parent hypotheses, not just a variant or paraphrase.
+- Every additional hypothesis must include a problem framing, central insight, theoretical story, and why it is not just a simple method combination.
+- If using two parents, identify the single causal story that makes the merge necessary.
 - Prefer divergence toward uncovered focus areas when possible.
 - Spread the refill across different focus areas or mutation operators whenever possible.
 - Returning a single evolved hypothesis object instead of a `hypotheses` array is invalid.
@@ -838,8 +905,12 @@ Required JSON schema:
       "title": "string",
       "focus_area": "string",
       "primary_bottleneck": "compute|memory bandwidth|latency|cache pressure|verification overhead|other",
+      "problem_framing": "string",
+      "central_insight": "string",
+      "theoretical_story": "string",
       "core_hypothesis": "string",
       "mechanism": "string",
+      "why_not_simple_combination": "string",
       "novelty_rationale": "string",
       "generation_strategy": "grounded_enhancement|repair|inspiration|combination|simplification|divergence",
       "mutation_operator": "grounded_enhancement|repair|inspiration|combination|simplification|divergence",
@@ -874,6 +945,8 @@ def build_meta_review_messages(
     prompt = f"""
 Perform a meta-review over the current research state.
 The job here is not only to pick the best hypothesis, but to identify recurring critique, blind spots, and next-iteration guidance for every agent.
+Pay special attention to whether top hypotheses have a complete paper story: problem tension -> central insight -> mechanism -> falsifiable prediction -> validation.
+Flag method-stacking patterns where a hypothesis is mainly "method A + method B + method C" without a unifying theoretical reason.
 
 Research goal:
 {research_goal}
@@ -902,11 +975,21 @@ Literature notes:
 Required JSON schema:
 {{
   "meta_review_critique": ["string"],
+  "story_guidance": {{
+    "frontier_story": "string",
+    "method_stacking_patterns": ["string"],
+    "theory_gaps": ["string"],
+    "next_generation_story_targets": ["string"],
+    "combination_policy": "string"
+  }},
   "generation_guidance": ["string"],
   "reflection_guidance": ["string"],
   "ranking_guidance": ["string"],
   "research_overview": {{
     "summary": "string",
+    "frontier_storyline": "string",
+    "anti_combination_guidance": ["string"],
+    "theory_gaps": ["string"],
     "priority_areas": ["string"],
     "top_ranked_hypotheses": ["string"],
     "suggested_next_steps": ["string"],
