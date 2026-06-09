@@ -9,22 +9,22 @@
 # thinking_llm is used for planning, hypothesis generation, evolution, literature
 # query planning, and prior-art repair.
 thinking_llm:
-  api_key: null
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4.1"
-  model_fallbacks: []
-  base_url_fallbacks: []
+  providers:
+    - api_key: null
+      base_url: "https://api.openai.com/v1"
+      model: "gpt-4.1"
 
 # critic_llm is used for safety checks, reflection, pairwise ranking, and
-# meta-review. It can point to the same provider/model as thinking_llm.
+# meta-review. Add more providers in order; if one fails, the next is tried.
 critic_llm:
-  api_key: null
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4.1"
-  model_fallbacks: []
-  base_url_fallbacks: []
+  providers:
+    - api_key: null
+      base_url: "https://api.openai.com/v1"
+      model: "gpt-4.1"
+    # - api_key: null
+    #   base_url: "https://openrouter.ai/api/v1"
+    #   model: "openai/gpt-4.1"
 
-llm_timeout_seconds: 520
 llm_retry_until_success: true
 max_retries: 2
 initial_retry_delay: 2

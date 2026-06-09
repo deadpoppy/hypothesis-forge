@@ -61,19 +61,22 @@ Only two LLM profiles are required:
 
 ```yaml
 thinking_llm:
-  api_key: null
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4.1"
-  model_fallbacks: []
+  providers:
+    - api_key: null
+      base_url: "https://api.openai.com/v1"
+      model: "gpt-4.1"
 
 critic_llm:
-  api_key: null
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4.1"
-  model_fallbacks: []
+  providers:
+    - api_key: null
+      base_url: "https://api.openai.com/v1"
+      model: "gpt-4.1"
+    - api_key: null
+      base_url: "https://openrouter.ai/api/v1"
+      model: "openai/gpt-4.1"
 ```
 
-`thinking_llm` handles planning, hypothesis generation, evolution, literature query planning, and prior-art repair. `critic_llm` handles safety checks, reflection, pairwise ranking, and meta-review. The two profiles may point to the same provider and model.
+`thinking_llm` handles planning, hypothesis generation, evolution, literature query planning, and prior-art repair. `critic_llm` handles safety checks, reflection, pairwise ranking, and meta-review. Each profile accepts one or more provider entries, and calls automatically move to the next configured entry if the current provider errors or is busy.
 
 You can put keys in `config.yaml`, but environment variables are safer:
 
@@ -82,7 +85,7 @@ export THINKING_LLM_API_KEY="your_thinking_key"
 export CRITIC_LLM_API_KEY="your_critic_key"
 ```
 
-For single-provider runs, `LLM_API_KEY` is also accepted as a shared fallback. Do not commit `config.yaml`.
+For single-key setups, `LLM_API_KEY` is also accepted as a shared fallback. Do not commit `config.yaml`.
 
 LLM calls retry until they succeed by default, which is useful when the provider is temporarily congested:
 
@@ -142,6 +145,8 @@ The Makefile wrapper is useful for short goals:
 ```bash
 make run GOAL="Study robust evaluation methods for AI scientific hypothesis generation" OUTPUT_DIR=results/smoke_test
 ```
+
+Runs resume automatically by default. If the same `--goal` and workflow settings are used with the same `--output-dir`, the CLI loads the newest matching `checkpoint_latest.json` or timestamped report and continues until the requested `--cycles` total is reached. Use `--no-resume` when you intentionally want to ignore existing artifacts in that directory.
 
 ## Outputs
 

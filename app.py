@@ -60,7 +60,7 @@ def _require_llm_api_key() -> None:
     raise InputValidationError(
         "LLM API key is not configured. Set `THINKING_LLM_API_KEY` and "
         "`CRITIC_LLM_API_KEY`, set shared `LLM_API_KEY`, or provide "
-        "`thinking_llm.api_key` and `critic_llm.api_key` in config.yaml."
+        "API keys inside the `thinking_llm` and `critic_llm` provider config in config.yaml."
     )
 
 
@@ -72,6 +72,113 @@ def _config_int(name: str, default: int, minimum: int | None = None) -> int:
     if minimum is not None:
         value = max(minimum, value)
     return value
+
+
+def _build_research_goal(args: argparse.Namespace, constraints: Dict[str, Any]) -> ResearchGoal:
+    return ResearchGoal(
+        description=args.goal,
+        constraints=constraints,
+        llm_model=args.model,
+        critic_llm_model=args.critic_model,
+        num_hypotheses=args.num_hypotheses,
+        generation_temperature=args.generation_temperature,
+        evolution_temperature=args.evolution_temperature,
+        reflection_temperature=args.reflection_temperature,
+        elo_k_factor=args.elo_k_factor,
+        top_k_hypotheses=args.top_k_hypotheses,
+        max_literature_results=args.max_literature_results,
+        enable_prior_art_check=False if args.disable_prior_art_check else None,
+        prior_art_queries_per_idea=args.prior_art_queries_per_idea,
+        prior_art_results_per_query=args.prior_art_results_per_query,
+        prior_art_embedding_candidates=args.prior_art_embedding_candidates,
+        prior_art_review_top_k=args.prior_art_review_top_k,
+        prior_art_similarity_threshold=args.prior_art_similarity_threshold,
+        prior_art_repair_attempts=args.prior_art_repair_attempts,
+        ranking_matches_per_cycle=args.ranking_matches_per_cycle,
+        proximity_similarity_threshold=args.proximity_similarity_threshold,
+        deep_review_top_k=args.deep_review_top_k,
+        hypothesis_decay_fraction=args.hypothesis_decay_fraction,
+        enable_safety_review=False if args.disable_safety_review else None,
+        max_concurrency=args.max_concurrency,
+    )
+
+
+def _cycle_is_complete(cycle: Dict[str, Any]) -> bool:
+    return isinstance(cycle, dict) and "statistics_after" in cycle and "cycle_duration" in cycle
+
+
+def _completed_cycle_prefix(cycles: Any) -> List[Dict[str, Any]]:
+    if not isinstance(cycles, list):
+        return []
+
+    completed = []
+    for cycle in cycles:
+        if not _cycle_is_complete(cycle):
+            break
+        completed.append(cycle)
+    return completed
+
+
+def _candidate_resume_paths(output_dir: str) -> List[Path]:
+    output_path = Path(output_dir)
+    if not output_path.exists() or not output_path.is_dir():
+        return []
+
+    candidates: List[Path] = []
+    checkpoint_path = output_path / "checkpoint_latest.json"
+    if checkpoint_path.exists():
+        candidates.append(checkpoint_path)
+
+    reports = sorted(
+        output_path.glob("co_scientist_run_*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for report_path in reports:
+        if report_path not in candidates:
+            candidates.append(report_path)
+    return candidates
+
+
+def _read_run_payload(path: Path) -> Dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Skipping unreadable resume payload %s: %s", path, exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_resume_state(output_dir: str, research_goal: ResearchGoal) -> Dict[str, Any] | None:
+    current_signature = research_goal.signature()
+    for path in _candidate_resume_paths(output_dir):
+        payload = _read_run_payload(path)
+        if not payload:
+            continue
+
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        final_context = payload.get("final_context") if isinstance(payload.get("final_context"), dict) else {}
+        stored_signature = final_context.get("goal_signature") or metadata.get("goal_signature")
+        if stored_signature != current_signature:
+            continue
+
+        raw_cycles = payload.get("cycles", [])
+        completed_cycles = _completed_cycle_prefix(raw_cycles)
+        context = ContextMemory.from_dict(final_context, research_goal)
+        if context.goal_signature != current_signature:
+            continue
+        if context.iteration_number < len(completed_cycles):
+            context.iteration_number = len(completed_cycles)
+
+        return {
+            "cycles": completed_cycles,
+            "context": context,
+            "path": str(path),
+            "partial_cycle_count": max(0, len(raw_cycles) - len(completed_cycles)) if isinstance(raw_cycles, list) else 0,
+        }
+
+    return None
 
 
 def _write_outputs(cycles: List[Dict[str, Any]], output_dir: str, context: ContextMemory) -> Dict[str, str]:
@@ -89,6 +196,7 @@ def _write_outputs(cycles: List[Dict[str, Any]], output_dir: str, context: Conte
                 "metadata": {
                     "generated_at": timestamp,
                     "cycle_count": len(cycles),
+                    "goal_signature": context.goal_signature,
                 },
                 "cycles": cycles,
                 "final_context": context.to_dict(),
@@ -118,6 +226,7 @@ def _write_checkpoint(cycles: List[Dict[str, Any]], output_dir: str, context: Co
                     "generated_at": dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
                     "cycle_count": len(cycles),
                     "checkpoint": True,
+                    "goal_signature": context.goal_signature,
                 },
                 "cycles": cycles,
                 "final_context": context.to_dict(),
@@ -136,38 +245,38 @@ def _write_checkpoint(cycles: List[Dict[str, Any]], output_dir: str, context: Co
 def run_cycles(args: argparse.Namespace) -> Dict[str, str]:
     constraints = _load_constraints(args.constraints)
     _require_llm_api_key()
-    research_goal = ResearchGoal(
-        description=args.goal,
-        constraints=constraints,
-        llm_model=args.model,
-        critic_llm_model=args.critic_model,
-        num_hypotheses=args.num_hypotheses,
-        generation_temperature=args.generation_temperature,
-        evolution_temperature=args.evolution_temperature,
-        reflection_temperature=args.reflection_temperature,
-        elo_k_factor=args.elo_k_factor,
-        top_k_hypotheses=args.top_k_hypotheses,
-        max_literature_results=args.max_literature_results,
-        enable_prior_art_check=False if args.disable_prior_art_check else None,
-        prior_art_queries_per_idea=args.prior_art_queries_per_idea,
-        prior_art_results_per_query=args.prior_art_results_per_query,
-        prior_art_embedding_candidates=args.prior_art_embedding_candidates,
-        prior_art_review_top_k=args.prior_art_review_top_k,
-        prior_art_similarity_threshold=args.prior_art_similarity_threshold,
-        prior_art_repair_attempts=args.prior_art_repair_attempts,
-        ranking_matches_per_cycle=args.ranking_matches_per_cycle,
-        proximity_similarity_threshold=args.proximity_similarity_threshold,
-        deep_review_top_k=args.deep_review_top_k,
-        hypothesis_decay_fraction=args.hypothesis_decay_fraction,
-        enable_safety_review=False if args.disable_safety_review else None,
-        max_concurrency=args.max_concurrency,
-    )
-    context = ContextMemory()
-    context.reset_for_goal(research_goal)
+    research_goal = _build_research_goal(args, constraints)
+
+    resume_state = None if getattr(args, "no_resume", False) else _load_resume_state(args.output_dir, research_goal)
+    if resume_state:
+        context = resume_state["context"]
+        cycles = list(resume_state["cycles"])
+        logger.info(
+            "Auto-resuming from %s with %d completed cycle(s).",
+            resume_state["path"],
+            len(cycles),
+        )
+        if resume_state["partial_cycle_count"]:
+            logger.info(
+                "Resume payload contained %d incomplete checkpoint cycle(s); completed cycle count remains %d.",
+                resume_state["partial_cycle_count"],
+                len(cycles),
+            )
+    else:
+        context = ContextMemory()
+        context.reset_for_goal(research_goal)
+        cycles = []
     supervisor = SupervisorAgent()
 
-    cycles = []
-    for cycle_index in range(args.cycles):
+    if len(cycles) >= args.cycles:
+        logger.info(
+            "Resume state already has %d completed cycle(s), meeting requested total %d.",
+            len(cycles),
+            args.cycles,
+        )
+        return _write_outputs(cycles, args.output_dir, context)
+
+    for cycle_index in range(len(cycles), args.cycles):
         logger.info("Running requested cycle %d/%d", cycle_index + 1, args.cycles)
         def _progress_checkpoint(step_name: str, partial_cycle: Dict[str, Any], partial_context: ContextMemory) -> None:
             logger.info("Writing progress checkpoint after step: %s", step_name)
@@ -242,6 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-concurrency", type=int, default=None, help="Maximum concurrent LLM/tool calls for parallel-safe stages.")
     parser.add_argument("--disable-safety-review", action="store_true", help="Skip automated research-goal safety review.")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable automatic resume from matching checkpoint/report files in the output directory.",
+    )
     parser.add_argument(
         "--allow-empty-cycles",
         action="store_true",

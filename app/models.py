@@ -72,6 +72,16 @@ def _normalize_weights(weights: Optional[Dict[str, Any]]) -> Dict[str, float]:
     return {key: value / total for key, value in merged.items()}
 
 
+def _dict_list(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _mapping(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _configured_llm_model(profile: str, default: str) -> str:
     prefixes = [profile]
     if profile == "thinking":
@@ -81,7 +91,24 @@ def _configured_llm_model(profile: str, default: str) -> str:
 
     for prefix in prefixes:
         block = config.get(f"{prefix}_llm")
-        if isinstance(block, dict):
+        if isinstance(block, list):
+            for item in block:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("model", "llm_model"):
+                    value = str(item.get(key) or "").strip()
+                    if value:
+                        return value
+        elif isinstance(block, dict):
+            providers = block.get("providers")
+            if isinstance(providers, list):
+                for item in providers:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("model", "llm_model"):
+                        value = str(item.get(key) or "").strip()
+                        if value:
+                            return value
             for key in ("model", "llm_model"):
                 value = str(block.get(key) or "").strip()
                 if value:
@@ -466,6 +493,80 @@ class Hypothesis:
     is_active: bool = True
     created_in_iteration: int = 0
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Hypothesis":
+        if not isinstance(data, dict):
+            data = {}
+
+        scores: Dict[str, float] = {}
+        raw_scores = data.get("scores")
+        if isinstance(raw_scores, dict):
+            for key, value in raw_scores.items():
+                try:
+                    scores[str(key)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+
+        hypothesis_id = str(data.get("id") or data.get("hypothesis_id") or "restored_hypothesis").strip()
+        try:
+            elo_score = float(data.get("elo_score", 1200.0))
+        except (TypeError, ValueError):
+            elo_score = 1200.0
+        try:
+            prior_art_repair_count = int(data.get("prior_art_repair_count", 0))
+        except (TypeError, ValueError):
+            prior_art_repair_count = 0
+        try:
+            created_in_iteration = int(data.get("created_in_iteration", 0))
+        except (TypeError, ValueError):
+            created_in_iteration = 0
+
+        return cls(
+            hypothesis_id=hypothesis_id,
+            title=str(data.get("title") or "Untitled hypothesis").strip(),
+            text=str(data.get("text") or "").strip(),
+            focus_area=str(data.get("focus_area") or "").strip(),
+            primary_bottleneck=str(data.get("primary_bottleneck") or "").strip(),
+            rationale=str(data.get("rationale") or "").strip(),
+            mechanism=str(data.get("mechanism") or "").strip(),
+            problem_framing=str(data.get("problem_framing") or "").strip(),
+            central_insight=str(data.get("central_insight") or "").strip(),
+            theoretical_story=str(data.get("theoretical_story") or "").strip(),
+            why_not_simple_combination=str(data.get("why_not_simple_combination") or "").strip(),
+            generation_strategy=str(data.get("generation_strategy") or "generation").strip(),
+            mutation_operator=str(data.get("mutation_operator") or "").strip(),
+            evolution_delta=str(data.get("evolution_delta") or "").strip(),
+            origin=str(data.get("origin") or "generation").strip(),
+            parent_ids=coerce_string_list(data.get("parent_ids", [])),
+            predictions=coerce_string_list(data.get("predictions", [])),
+            key_assumptions=coerce_string_list(data.get("key_assumptions", [])),
+            validation_experiments=coerce_string_list(data.get("validation_experiments", [])),
+            failure_modes=coerce_string_list(data.get("failure_modes", [])),
+            supporting_observations=coerce_string_list(data.get("supporting_observations", [])),
+            contradicting_observations=coerce_string_list(data.get("contradicting_observations", [])),
+            improvement_actions=coerce_string_list(data.get("improvement_actions", [])),
+            search_queries=coerce_string_list(data.get("search_queries", [])),
+            novelty_review=data.get("novelty_review"),
+            feasibility_review=data.get("feasibility_review"),
+            correctness_review=data.get("correctness_review"),
+            testability_review=data.get("testability_review"),
+            review_verdict=data.get("review_verdict"),
+            review_summary=str(data.get("review_summary") or ""),
+            scores=scores,
+            elo_score=elo_score,
+            review_comments=coerce_string_list(data.get("review_comments", [])),
+            references=coerce_string_list(data.get("references", [])),
+            literature_notes=_dict_list(data.get("literature_notes")),
+            prior_art_signature=data.get("prior_art_signature"),
+            prior_art_audit=_mapping(data.get("prior_art_audit")),
+            prior_art_similar_papers=_dict_list(data.get("prior_art_similar_papers")),
+            prior_art_repair_count=prior_art_repair_count,
+            debate_history=_dict_list(data.get("debate_history")),
+            specialized_reviews=_dict_list(data.get("specialized_reviews")),
+            is_active=bool(data.get("is_active", True)),
+            created_in_iteration=max(0, created_in_iteration),
+        )
+
     def apply_review(self, review: Dict[str, Any], stage_label: str) -> None:
         if not isinstance(review, dict):
             return
@@ -691,6 +792,51 @@ class ContextMemory:
     goal_signature: Optional[str] = None
     last_cycle_statistics: Dict[str, Any] = field(default_factory=dict)
     pairwise_decisions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], research_goal: ResearchGoal) -> "ContextMemory":
+        context = cls()
+        if not isinstance(data, dict):
+            context.reset_for_goal(research_goal)
+            return context
+
+        raw_hypotheses = data.get("hypotheses", {})
+        if isinstance(raw_hypotheses, dict):
+            for key, value in raw_hypotheses.items():
+                if not isinstance(value, dict):
+                    continue
+                restored = Hypothesis.from_dict({**value, "id": value.get("id") or key})
+                context.add_hypothesis(restored)
+        elif isinstance(raw_hypotheses, list):
+            for value in raw_hypotheses:
+                if isinstance(value, dict):
+                    context.add_hypothesis(Hypothesis.from_dict(value))
+
+        context.tournament_results = _dict_list(data.get("tournament_results"))
+        context.meta_review_feedback = _dict_list(data.get("meta_review_feedback"))
+        context.research_overviews = _dict_list(data.get("research_overviews"))
+        context.cycle_history = _dict_list(data.get("cycle_history"))
+
+        research_plan = data.get("research_plan")
+        context.research_plan = ResearchPlan.from_dict(research_plan, research_goal) if isinstance(research_plan, dict) else None
+
+        try:
+            context.iteration_number = max(0, int(data.get("iteration_number", 0)))
+        except (TypeError, ValueError):
+            context.iteration_number = 0
+
+        context.goal_signature = str(data.get("goal_signature") or research_goal.signature())
+        context.last_cycle_statistics = _mapping(data.get("last_cycle_statistics"))
+
+        raw_pairwise_decisions = data.get("pairwise_decisions")
+        if isinstance(raw_pairwise_decisions, dict):
+            context.pairwise_decisions = {
+                str(key): value
+                for key, value in raw_pairwise_decisions.items()
+                if isinstance(value, dict)
+            }
+
+        return context
 
     def reset_for_goal(self, research_goal: ResearchGoal) -> None:
         self.hypotheses.clear()

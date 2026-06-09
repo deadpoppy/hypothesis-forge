@@ -1,4 +1,6 @@
 import itertools
+import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -38,6 +40,15 @@ from app.tools.semantic_scholar import SemanticScholarSearchTool
 from app.trajectory import analyze_run_payload
 from app.utils import coerce_string_list, similarity_score
 from app.workflow import SupervisorAgent
+
+
+def _load_cli_module():
+    repo_root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("co_scientist_cli_under_test", repo_root / "app.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 class CoreBehaviorTests(unittest.TestCase):
@@ -94,9 +105,12 @@ class CoreBehaviorTests(unittest.TestCase):
 logging_level: INFO
 openai_api_key: null
 openrouter_base_url: null
-llm_model: test-model
-llm_model_fallbacks: []
-llm_base_url_fallbacks: []
+thinking_llm:
+  providers:
+    - model: test-model
+critic_llm:
+  providers:
+    - model: test-model
 """.strip(),
                 encoding="utf-8",
             )
@@ -118,6 +132,142 @@ llm_base_url_fallbacks: []
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Input error: LLM API key is not configured", result.stdout)
         self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_context_memory_round_trips_from_saved_payload(self):
+        goal = ResearchGoal("resume goal", enable_safety_review=False)
+        context = ContextMemory()
+        context.reset_for_goal(goal)
+        context.research_plan = ResearchPlan.from_goal(goal)
+        context.iteration_number = 1
+        context.last_cycle_statistics = {"total_hypotheses": 1}
+        context.pairwise_decisions = {"H1::H2": {"winner_id": "H1"}}
+        context.add_hypothesis(
+            Hypothesis(
+                "H1",
+                "Restored Idea",
+                "idea text",
+                focus_area="runtime routing",
+                scores={"novelty": 4.0},
+                elo_score=1325.5,
+                literature_notes=[{"title": "Paper"}],
+                created_in_iteration=1,
+            )
+        )
+
+        restored = ContextMemory.from_dict(context.to_dict(), goal)
+
+        self.assertEqual(restored.goal_signature, goal.signature())
+        self.assertEqual(restored.iteration_number, 1)
+        self.assertEqual(restored.research_plan.objective, goal.description)
+        self.assertEqual(restored.hypotheses["H1"].title, "Restored Idea")
+        self.assertEqual(restored.hypotheses["H1"].scores["novelty"], 4.0)
+        self.assertEqual(restored.pairwise_decisions["H1::H2"]["winner_id"], "H1")
+
+    def test_resume_state_loads_matching_checkpoint_only(self):
+        cli = _load_cli_module()
+        goal = ResearchGoal("resume goal", num_hypotheses=2, enable_safety_review=False)
+        context = ContextMemory()
+        context.reset_for_goal(goal)
+        context.research_plan = ResearchPlan.from_goal(goal)
+        context.iteration_number = 1
+        context.add_hypothesis(Hypothesis("H1", "Saved Idea", "idea text", created_in_iteration=1))
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            payload = {
+                "metadata": {"cycle_count": 2, "goal_signature": goal.signature()},
+                "cycles": [
+                    {"iteration": 1, "steps": {}, "errors": [], "statistics_after": {}, "cycle_duration": 0.1},
+                    {"iteration": 2, "steps": {"generation": {"hypotheses": []}}, "errors": []},
+                ],
+                "final_context": context.to_dict(),
+            }
+            (output_dir / "checkpoint_latest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+            state = cli._load_resume_state(str(output_dir), goal)
+            mismatch = cli._load_resume_state(str(output_dir), ResearchGoal("different goal", num_hypotheses=2, enable_safety_review=False))
+
+        self.assertIsNotNone(state)
+        self.assertEqual(len(state["cycles"]), 1)
+        self.assertEqual(state["partial_cycle_count"], 1)
+        self.assertEqual(state["context"].hypotheses["H1"].title, "Saved Idea")
+        self.assertIsNone(mismatch)
+
+    def test_run_cycles_auto_resumes_to_requested_total(self):
+        cli = _load_cli_module()
+
+        class FakeSupervisor:
+            def __init__(self):
+                self.calls = 0
+
+            def run_cycle(self, research_goal, context, progress_callback=None):
+                self.calls += 1
+                iteration = context.iteration_number + 1
+                hypothesis = Hypothesis(f"H{iteration}", f"Idea {iteration}", "idea text", created_in_iteration=iteration)
+                context.add_hypothesis(hypothesis)
+                context.iteration_number = iteration
+                context.last_cycle_statistics = context.compute_statistics()
+                cycle = {
+                    "iteration": iteration,
+                    "research_plan": context.research_plan.to_dict() if context.research_plan else {},
+                    "steps": {"generation": {"hypotheses": [hypothesis.to_dict()]}},
+                    "errors": [],
+                    "statistics_after": context.last_cycle_statistics,
+                    "cycle_duration": 0.1,
+                }
+                if progress_callback is not None:
+                    progress_callback("cycle_complete", cycle, context)
+                return cycle
+
+        with TemporaryDirectory() as temp_dir:
+            args = cli.build_parser().parse_args(
+                [
+                    "--goal",
+                    "resume goal",
+                    "--cycles",
+                    "2",
+                    "--output-dir",
+                    temp_dir,
+                    "--num-hypotheses",
+                    "2",
+                    "--disable-safety-review",
+                ]
+            )
+            goal = cli._build_research_goal(args, {})
+            context = ContextMemory()
+            context.reset_for_goal(goal)
+            context.research_plan = ResearchPlan.from_goal(goal)
+            context.iteration_number = 1
+            context.add_hypothesis(Hypothesis("H1", "Saved Idea", "idea text", created_in_iteration=1))
+            existing_cycle = {
+                "iteration": 1,
+                "research_plan": context.research_plan.to_dict(),
+                "steps": {},
+                "errors": [],
+                "statistics_after": context.compute_statistics(),
+                "cycle_duration": 0.1,
+            }
+            (Path(temp_dir) / "checkpoint_latest.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"cycle_count": 1, "goal_signature": goal.signature()},
+                        "cycles": [existing_cycle],
+                        "final_context": context.to_dict(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_supervisor = FakeSupervisor()
+
+            with patch.object(cli, "_require_llm_api_key"), patch.object(cli, "SupervisorAgent", return_value=fake_supervisor):
+                written = cli.run_cycles(args)
+
+            report = json.loads(Path(written["json"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(fake_supervisor.calls, 1)
+        self.assertEqual([cycle["iteration"] for cycle in report["cycles"]], [1, 2])
+        self.assertIn("H1", report["final_context"]["hypotheses"])
+        self.assertIn("H2", report["final_context"]["hypotheses"])
 
     def test_string_list_coercion_does_not_split_strings(self):
         self.assertEqual(coerce_string_list("one complete item"), ["one complete item"])
@@ -1366,13 +1516,13 @@ llm_base_url_fallbacks: []
 
         fake_client = FakeClient()
 
-        with patch("app.llm._candidate_models", return_value=["primary-model", "fallback-model"]), patch(
-            "app.llm._candidate_base_urls",
-            return_value=["http://provider.test/v1"],
-        ), patch("app.llm.get_configured_api_key", return_value="test-key"), patch(
-            "app.llm._get_client",
-            return_value=fake_client,
-        ):
+        with patch(
+            "app.llm._candidate_providers",
+            return_value=[
+                llm_module.LLMProviderCandidate(model="primary-model", api_key="primary-key", base_url="http://primary.test/v1"),
+                llm_module.LLMProviderCandidate(model="fallback-model", api_key="fallback-key", base_url="http://fallback.test/v1"),
+            ],
+        ), patch("app.llm._get_client", return_value=fake_client):
             text = call_llm("Return ok", temperature=0.1)
 
         self.assertEqual(text, "{\"ok\":true}")
@@ -1414,13 +1564,10 @@ llm_base_url_fallbacks: []
                 "initial_retry_delay": 0,
                 "max_retry_delay_seconds": 0,
             },
-        ), patch("app.llm._candidate_models", return_value=["primary-model"]), patch(
-            "app.llm._candidate_base_urls",
-            return_value=["http://provider.test/v1"],
-        ), patch("app.llm.get_configured_api_key", return_value="test-key"), patch(
-            "app.llm._get_client",
-            return_value=fake_client,
-        ):
+        ), patch(
+            "app.llm._candidate_providers",
+            return_value=[llm_module.LLMProviderCandidate(model="primary-model", api_key="test-key", base_url="http://provider.test/v1")],
+        ), patch("app.llm._get_client", return_value=fake_client):
             text = call_llm("Return ok", temperature=0.1)
 
         self.assertEqual(text, "{\"ok\":true}")
@@ -1456,10 +1603,9 @@ llm_base_url_fallbacks: []
         class FakeOpenAI:
             instances = []
 
-            def __init__(self, base_url, api_key, timeout, max_retries):
+            def __init__(self, base_url, api_key, max_retries):
                 self.base_url = base_url
                 self.api_key = api_key
-                self.timeout = timeout
                 self.max_retries = max_retries
                 self.chat = type("Chat", (), {"completions": FakeChatCompletions()})()
                 self.instances.append(self)
@@ -1479,7 +1625,6 @@ llm_base_url_fallbacks: []
                         "base_url": "http://critic.test/v1",
                         "model": "critic-model",
                     },
-                    "llm_timeout_seconds": 12,
                     "max_retries": 1,
                     "initial_retry_delay": 0,
                 },
@@ -1492,8 +1637,75 @@ llm_base_url_fallbacks: []
         self.assertEqual(text, "{\"ok\":true}")
         self.assertEqual(FakeOpenAI.instances[0].api_key, "critic-key")
         self.assertEqual(FakeOpenAI.instances[0].base_url, "http://critic.test/v1")
-        self.assertEqual(FakeOpenAI.instances[0].timeout, 12)
         self.assertEqual(FakeOpenAI.instances[0].chat.completions.calls[0]["model"], "critic-model")
+
+    def test_llm_critic_profile_falls_back_to_secondary_provider(self):
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeCompletion:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        class FakeChatCompletions:
+            def __init__(self, owner):
+                self.owner = owner
+
+            def create(self, model, messages, temperature):
+                self.owner.calls.append((self.owner.base_url, self.owner.api_key, model))
+                if self.owner.base_url == "http://critic-a.test/v1":
+                    raise RuntimeError("provider busy")
+                return FakeCompletion("{\"ok\":true}")
+
+        class FakeOpenAI:
+            instances = []
+
+            def __init__(self, base_url, api_key, max_retries):
+                self.base_url = base_url
+                self.api_key = api_key
+                self.max_retries = max_retries
+                self.calls = []
+                self.chat = type("Chat", (), {"completions": FakeChatCompletions(self)})()
+                self.instances.append(self)
+
+        llm_module._clients.clear()
+        try:
+            with patch.dict(os.environ, {}, clear=True), patch.dict(
+                llm_module.config,
+                {
+                    "critic_llm": {
+                        "providers": [
+                            {
+                                "api_key": "critic-key-a",
+                                "base_url": "http://critic-a.test/v1",
+                                "model": "critic-model-a",
+                            },
+                            {
+                                "api_key": "critic-key-b",
+                                "base_url": "http://critic-b.test/v1",
+                                "model": "critic-model-b",
+                            },
+                        ]
+                    },
+                    "max_retries": 1,
+                    "initial_retry_delay": 0,
+                    "llm_retry_until_success": False,
+                },
+                clear=True,
+            ), patch("app.llm.OpenAI", FakeOpenAI):
+                text = llm_module.call_llm("Return ok", temperature=0.1, profile="critic")
+        finally:
+            llm_module._clients.clear()
+
+        self.assertEqual(text, "{\"ok\":true}")
+        self.assertEqual(len(FakeOpenAI.instances), 2)
+        self.assertEqual(FakeOpenAI.instances[0].calls, [("http://critic-a.test/v1", "critic-key-a", "critic-model-a")])
+        self.assertEqual(FakeOpenAI.instances[1].calls, [("http://critic-b.test/v1", "critic-key-b", "critic-model-b")])
 
     def test_similarity_score_falls_back_when_sentence_transformer_unavailable(self):
         with patch("app.utils.get_sentence_transformer_model", side_effect=RuntimeError("offline")):
