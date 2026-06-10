@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 from app.config import config
 from app.llm import get_configured_api_key
 from app.models import ContextMemory, ResearchGoal
+from app.reference import ReferencePaperError, log_reference_summary, prepare_reference_paper
 from app.reports import build_markdown_report
 from app.utils import logger
 from app.workflow import SupervisorAgent
@@ -78,6 +79,7 @@ def _build_research_goal(args: argparse.Namespace, constraints: Dict[str, Any]) 
     return ResearchGoal(
         description=args.goal,
         constraints=constraints,
+        reference_arxiv_url=args.reference_arxiv,
         llm_model=args.model,
         critic_llm_model=args.critic_model,
         num_hypotheses=args.num_hypotheses,
@@ -96,7 +98,6 @@ def _build_research_goal(args: argparse.Namespace, constraints: Dict[str, Any]) 
         prior_art_repair_attempts=args.prior_art_repair_attempts,
         ranking_matches_per_cycle=args.ranking_matches_per_cycle,
         proximity_similarity_threshold=args.proximity_similarity_threshold,
-        deep_review_top_k=args.deep_review_top_k,
         hypothesis_decay_fraction=args.hypothesis_decay_fraction,
         enable_safety_review=False if args.disable_safety_review else None,
         max_concurrency=args.max_concurrency,
@@ -246,6 +247,15 @@ def run_cycles(args: argparse.Namespace) -> Dict[str, str]:
     constraints = _load_constraints(args.constraints)
     _require_llm_api_key()
     research_goal = _build_research_goal(args, constraints)
+    try:
+        research_goal.reference_paper_context = prepare_reference_paper(
+            args.reference_arxiv,
+            model=research_goal.llm_model,
+            temperature=max(0.05, min(0.2, research_goal.reflection_temperature)),
+        )
+    except ReferencePaperError as exc:
+        raise InputValidationError(f"Could not prepare reference arXiv paper: {exc}") from exc
+    log_reference_summary(research_goal.reference_paper_context)
 
     resume_state = None if getattr(args, "no_resume", False) else _load_resume_state(args.output_dir, research_goal)
     if resume_state:
@@ -266,6 +276,7 @@ def run_cycles(args: argparse.Namespace) -> Dict[str, str]:
         context = ContextMemory()
         context.reset_for_goal(research_goal)
         cycles = []
+    context.reference_paper_context = dict(research_goal.reference_paper_context)
     supervisor = SupervisorAgent()
 
     if len(cycles) >= args.cycles:
@@ -312,6 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--goal", required=True, help="Research goal to investigate.")
+    parser.add_argument("--reference-arxiv", required=True, help="Required reference paper arXiv URL or ID.")
     parser.add_argument("--constraints", help="Optional JSON file containing explicit constraints.")
     parser.add_argument(
         "--cycles",
@@ -336,13 +348,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-prior-art-check", action="store_true", help="Skip large-pool prior-art duplicate checking.")
     parser.add_argument("--prior-art-queries-per-idea", type=int, default=None, help="Maximum prior-art search queries planned for each idea.")
     parser.add_argument("--prior-art-results-per-query", type=int, default=None, help="Large-pool papers retrieved per prior-art query.")
-    parser.add_argument("--prior-art-embedding-candidates", type=int, default=None, help="Lexical prefilter size before embedding recall.")
+    parser.add_argument("--prior-art-embedding-candidates", type=int, default=None, help="Embedding/vector recall candidates scored before LLM prior-art audit.")
     parser.add_argument("--prior-art-review-top-k", type=int, default=None, help="Top recalled prior-art papers sent to LLM audit.")
     parser.add_argument("--prior-art-similarity-threshold", type=float, default=None, help="Minimum recall score before LLM duplicate audit.")
     parser.add_argument("--prior-art-repair-attempts", type=int, default=None, help="Repair attempts allowed after a duplicate prior-art audit.")
     parser.add_argument("--ranking-matches-per-cycle", type=int, default=None, help="Maximum pairwise ranking matches per ranking stage.")
     parser.add_argument("--proximity-similarity-threshold", type=float, default=None, help="Threshold for proximity clusters.")
-    parser.add_argument("--deep-review-top-k", type=int, default=None, help="Active hypotheses to run specialized reflection reviews on.")
     parser.add_argument(
         "--hypothesis-decay-fraction",
         type=float,

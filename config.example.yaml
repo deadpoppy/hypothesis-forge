@@ -30,28 +30,35 @@ max_retries: 2
 initial_retry_delay: 2
 max_retry_delay_seconds: 60
 
-# Default run controls. With these set, a normal run only needs --goal and --output-dir.
+# Default run controls. A normal run needs --goal, --reference-arxiv, and --output-dir.
 cycles: 5
 output_dir: "results"
 num_hypotheses: 5
 top_k_hypotheses: 3
 max_literature_results: 6
 ranking_matches_per_cycle: 1000
-deep_review_top_k: 3
 max_concurrency: 16
 
-# Scoring, review, and lifecycle controls
+# Scoring, review, reranking, and lifecycle controls
 elo_k_factor: 32
 proximity_similarity_threshold: 0.55
-hypothesis_decay_fraction: 0.10
+hypothesis_decay_fraction: 0.0
+enable_codex_reranking: true
+codex_rerank_model: "gpt-5.4"
+codex_rerank_timeout_seconds: 900
 enable_safety_review: true
 enable_prior_art_check: true
 prior_art_queries_per_idea: 6
 prior_art_results_per_query: 50
-prior_art_embedding_candidates: 80
+prior_art_embedding_candidates: 200
 prior_art_review_top_k: 12
 prior_art_similarity_threshold: 0.38
 prior_art_repair_attempts: 1
+prior_art_include_cache_corpus: true
+prior_art_vector_index_path: ".cache/prior_art_vector_index.npz"
+prior_art_vector_index_backend: "auto"  # auto uses FAISS if installed, otherwise numpy exact search
+prior_art_vector_batch_size: 64
+prior_art_vector_search_chunk_size: 20000
 
 # Literature grounding and cache
 literature_sources:
@@ -68,11 +75,15 @@ arxiv_rate_limit_max_retries: 1
 arxiv_rate_limit_retry_after_seconds: 20.0
 arxiv_failure_cooldown_seconds: 900
 arxiv_max_consecutive_failures: 3
+reference_arxiv_timeout_seconds: 180
+reference_markdown_char_limit: 24000
 
 # Semantic similarity model used for prior-art recall and hypothesis proximity.
 sentence_transformer_enabled: true
-sentence_transformer_model: "all-MiniLM-L6-v2"
-sentence_transformer_local_files_only: true
+sentence_transformer_model: "BAAI/bge-small-en-v1.5"
+sentence_transformer_local_files_only: false
+prior_art_query_prefix: ""
+prior_art_document_prefix: ""
 
 # Temperature defaults by workflow stage.
 step_temperatures:

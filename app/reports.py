@@ -14,7 +14,13 @@ def _format_list(items: List[Any]) -> str:
 
 
 def _top_hypotheses(cycle: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
-    final_step = cycle.get("steps", {}).get("ranking_final") or cycle.get("steps", {}).get("ranking") or {}
+    final_step = (
+        cycle.get("steps", {}).get("codex_reranking_final")
+        or cycle.get("steps", {}).get("ranking_final")
+        or cycle.get("steps", {}).get("codex_reranking")
+        or cycle.get("steps", {}).get("ranking")
+        or {}
+    )
     hypotheses = final_step.get("hypotheses", [])
     return sorted(hypotheses, key=lambda item: item.get("elo_score", 0), reverse=True)[:limit]
 
@@ -60,6 +66,21 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
             parts.append(_format_list(errors))
 
         research_plan = cycle.get("research_plan", {})
+        reference_paper = cycle.get("reference_paper", {})
+        if isinstance(reference_paper, dict) and reference_paper:
+            parts.append(_line("### Reference Paper"))
+            title = reference_paper.get("title") or reference_paper.get("arxiv_id") or "Reference paper"
+            url = reference_paper.get("arxiv_url", "")
+            if url:
+                parts.append(_line(f"- [{title}]({url})"))
+            else:
+                parts.append(_line(f"- {title}"))
+            if reference_paper.get("concise_summary"):
+                parts.append(_line(f"Summary: {reference_paper.get('concise_summary')}"))
+            if reference_paper.get("limitations"):
+                parts.append(_line("Reference limitations to build on:"))
+                parts.append(_format_list(reference_paper.get("limitations", [])[:5]))
+
         parts.append(_line("### Research Plan"))
         parts.append(_line(f"Objective: {research_plan.get('objective', '')}"))
         parts.append(_line(f"Domain: {research_plan.get('domain', '')}"))
@@ -96,6 +117,32 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
                 parts.append(_line(f"Why not a simple combination: {hypothesis.get('why_not_simple_combination')}"))
             parts.append(_line(hypothesis.get("text", "")))
             parts.append(_line(f"Scores: `{hypothesis.get('scores', {})}`"))
+            review_artifacts = hypothesis.get("review_artifacts", [])
+            if review_artifacts:
+                latest_review = review_artifacts[-1]
+                parts.append(_line("Latest review:"))
+                if latest_review.get("short_summary"):
+                    parts.append(_line(latest_review.get("short_summary", "")))
+                if latest_review.get("reflection"):
+                    parts.append(_line(f"Reflection: {latest_review.get('reflection')}"))
+                if latest_review.get("feasibility_rationale"):
+                    parts.append(_line(f"Feasibility: {latest_review.get('feasibility_rationale')}"))
+                if latest_review.get("weaknesses"):
+                    parts.append(_line("Weaknesses:"))
+                    parts.append(_format_list(latest_review.get("weaknesses", [])[:5]))
+            codex_reviews = hypothesis.get("codex_rerank_reviews", [])
+            if codex_reviews:
+                latest_codex = codex_reviews[-1]
+                parts.append(_line("Codex rerank review:"))
+                parts.append(_line(f"Rank: `{latest_codex.get('rank', 'n/a')}`"))
+                if latest_codex.get("summary"):
+                    parts.append(_line(latest_codex.get("summary", "")))
+                if latest_codex.get("weaknesses"):
+                    parts.append(_line("Codex weaknesses:"))
+                    parts.append(_format_list(latest_codex.get("weaknesses", [])[:4]))
+                if latest_codex.get("novelty_risks"):
+                    parts.append(_line("Codex novelty risks:"))
+                    parts.append(_format_list(latest_codex.get("novelty_risks", [])[:4]))
             prior_art_audit = hypothesis.get("prior_art_audit", {})
             if isinstance(prior_art_audit, dict) and prior_art_audit:
                 parts.append(_line(f"Prior-art risk: `{prior_art_audit.get('novelty_risk', 'unknown')}`"))
@@ -116,39 +163,38 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
             if experiments:
                 parts.append(_line("Validation experiments:"))
                 parts.append(_format_list(experiments))
-            specialized_reviews = hypothesis.get("specialized_reviews", [])
-            if specialized_reviews:
-                latest_specialized = specialized_reviews[-1]
-                parts.append(_line("Specialized reflection:"))
-                parts.append(_line(latest_specialized.get("short_summary", "")))
-                deep_review = latest_specialized.get("deep_verification", {})
-                simulation_review = latest_specialized.get("simulation_review", {})
-                invalidating = deep_review.get("invalidating_assumptions", []) if isinstance(deep_review, dict) else []
-                failure_scenarios = simulation_review.get("failure_scenarios", []) if isinstance(simulation_review, dict) else []
-                if invalidating:
-                    parts.append(_line("Invalidating assumptions:"))
-                    parts.append(_format_list(invalidating))
-                if failure_scenarios:
-                    parts.append(_line("Simulation failure scenarios:"))
-                    parts.append(_format_list(failure_scenarios))
-
         parts.append(_line("### Ranking Diagnostics"))
-        for step_name in ("ranking", "ranking_final"):
+        for step_name in ("ranking", "codex_reranking", "ranking_final", "codex_reranking_final"):
             step = cycle.get("steps", {}).get(step_name, {})
             if step:
-                parts.append(
-                    _line(
-                        f"- {step_name}: matches={len(step.get('matches', []))}, "
-                        f"skipped_cached_pairs={step.get('skipped_cached_pairs', 0)}"
+                if step_name.startswith("codex"):
+                    parts.append(
+                        _line(
+                            f"- {step_name}: status={step.get('status', 'n/a')}, "
+                            f"candidates={step.get('candidate_ids', [])}"
+                        )
                     )
-                )
+                else:
+                    parts.append(
+                        _line(
+                            f"- {step_name}: matches={len(step.get('matches', []))}, "
+                            f"skipped_cached_pairs={step.get('skipped_cached_pairs', 0)}"
+                        )
+                    )
 
         parts.append(_line("### Generation Diagnostics"))
-        for step_name in ("generation", "prior_art_check", "evolution", "prior_art_check_evolved"):
+        for step_name in ("generation", "prior_art_check", "evolution", "evolution_replacement_pruning", "prior_art_check_evolved"):
             step = cycle.get("steps", {}).get(step_name, {})
             if not step:
                 continue
-            if step_name.startswith("prior_art_check"):
+            if step_name == "evolution_replacement_pruning":
+                parts.append(
+                    _line(
+                        f"- {step_name}: new_active_evolved={step.get('new_active_evolved_count', 0)}, "
+                        f"pruned={step.get('pruned_count', 0)}"
+                    )
+                )
+            elif step_name.startswith("prior_art_check"):
                 parts.append(
                     _line(
                         f"- {step_name}: checked={step.get('checked_count', 0)}, "

@@ -5,6 +5,7 @@ import time
 from typing import Callable, Dict, List
 
 from .agents import (
+    CodexRerankingAgent,
     EvolutionAgent,
     GenerationAgent,
     MetaReviewAgent,
@@ -30,6 +31,7 @@ class SupervisorAgent:
         self.reflection_agent = ReflectionAgent()
         self.proximity_agent = ProximityAgent()
         self.ranking_agent = RankingAgent()
+        self.codex_reranking_agent = CodexRerankingAgent()
         self.evolution_agent = EvolutionAgent()
         self.meta_review_agent = MetaReviewAgent()
 
@@ -50,6 +52,7 @@ class SupervisorAgent:
 
         cycle_details = {
             "iteration": iteration,
+            "reference_paper": context.reference_paper_context or research_goal.reference_paper_context,
             "research_plan": context.research_plan.to_dict() if context.research_plan else {},
             "steps": {},
             "errors": [],
@@ -98,18 +101,14 @@ class SupervisorAgent:
         emit_progress("prior_art_check")
 
         generation_review_candidates = [hypothesis for hypothesis in generation_result.hypotheses if hypothesis.is_active]
-        initial_review_result = self.reflection_agent.initial_review(generation_review_candidates, research_goal, context)
-        self._add_step(cycle_details, initial_review_result)
-        emit_progress("initial_review")
-
-        full_review_candidates = [hypothesis for hypothesis in generation_review_candidates if hypothesis.is_active]
-        full_review_result = self.reflection_agent.full_review(full_review_candidates, research_goal, context)
-        self._add_step(cycle_details, full_review_result)
-        emit_progress("full_review")
-
-        specialized_review_result = self.reflection_agent.specialized_review(full_review_candidates, research_goal, context)
-        self._add_step(cycle_details, specialized_review_result)
-        emit_progress("specialized_review")
+        review_result = self.reflection_agent.review_hypotheses(
+            generation_review_candidates,
+            research_goal,
+            context,
+            step_name="review",
+        )
+        self._add_step(cycle_details, review_result)
+        emit_progress("review")
 
         proximity_before_result = self.proximity_agent.build_proximity_graph(
             research_goal=research_goal,
@@ -128,11 +127,23 @@ class SupervisorAgent:
         self._add_step(cycle_details, ranking_result)
         emit_progress("ranking")
 
+        codex_reranking_result = self.codex_reranking_agent.rerank_top_hypotheses(
+            research_goal=research_goal,
+            context=context,
+            step_name="codex_reranking",
+        )
+        self._add_step(cycle_details, codex_reranking_result)
+        emit_progress("codex_reranking")
+
         evolution_result = self.evolution_agent.evolve_hypotheses(research_goal, context)
         self._add_step(cycle_details, evolution_result)
         for hypothesis in evolution_result.hypotheses:
             context.add_hypothesis(hypothesis)
         emit_progress("evolution")
+
+        replacement_pruning_result = self._prune_replaced_hypotheses(research_goal, context, evolution_result.hypotheses)
+        self._add_step(cycle_details, replacement_pruning_result)
+        emit_progress("evolution_replacement_pruning")
 
         prior_art_evolved = self.prior_art_agent.check_hypotheses(
             evolution_result.hypotheses,
@@ -144,18 +155,14 @@ class SupervisorAgent:
         emit_progress("prior_art_check_evolved")
 
         evolution_review_candidates = [hypothesis for hypothesis in evolution_result.hypotheses if hypothesis.is_active]
-        initial_review_evolved = self.reflection_agent.initial_review(evolution_review_candidates, research_goal, context)
-        self._add_step(cycle_details, initial_review_evolved, step_name="initial_review_evolved")
-        emit_progress("initial_review_evolved")
-
-        full_review_evolved_candidates = [hypothesis for hypothesis in evolution_review_candidates if hypothesis.is_active]
-        full_review_evolved = self.reflection_agent.full_review(full_review_evolved_candidates, research_goal, context)
-        self._add_step(cycle_details, full_review_evolved, step_name="full_review_evolved")
-        emit_progress("full_review_evolved")
-
-        specialized_review_evolved = self.reflection_agent.specialized_review(full_review_evolved_candidates, research_goal, context)
-        self._add_step(cycle_details, specialized_review_evolved, step_name="specialized_review_evolved")
-        emit_progress("specialized_review_evolved")
+        review_evolved = self.reflection_agent.review_hypotheses(
+            evolution_review_candidates,
+            research_goal,
+            context,
+            step_name="review_evolved",
+        )
+        self._add_step(cycle_details, review_evolved)
+        emit_progress("review_evolved")
 
         proximity_final_result = self.proximity_agent.build_proximity_graph(
             research_goal=research_goal,
@@ -173,6 +180,14 @@ class SupervisorAgent:
         )
         self._add_step(cycle_details, ranking_final_result)
         emit_progress("ranking_final")
+
+        codex_reranking_final = self.codex_reranking_agent.rerank_top_hypotheses(
+            research_goal=research_goal,
+            context=context,
+            step_name="codex_reranking_final",
+        )
+        self._add_step(cycle_details, codex_reranking_final)
+        emit_progress("codex_reranking_final")
 
         meta_review_result = self.meta_review_agent.summarize_and_feedback(
             research_goal=research_goal,
@@ -202,6 +217,57 @@ class SupervisorAgent:
         logger.info("--- Cycle %d complete ---", context.iteration_number)
         emit_progress("cycle_complete")
         return cycle_details
+
+    def _prune_replaced_hypotheses(
+        self,
+        research_goal: ResearchGoal,
+        context: ContextMemory,
+        new_hypotheses: List,
+    ) -> StepResult:
+        active_new_ids = {
+            hypothesis.hypothesis_id
+            for hypothesis in new_hypotheses
+            if hypothesis.is_active
+        }
+        target_prune_count = len(active_new_ids)
+        active_old = sorted(
+            [
+                hypothesis
+                for hypothesis in context.get_active_hypotheses()
+                if hypothesis.hypothesis_id not in active_new_ids
+            ],
+            key=lambda hypothesis: (hypothesis.elo_score, hypothesis.created_in_iteration, hypothesis.hypothesis_id),
+        )
+        prune_count = min(target_prune_count, len(active_old))
+        pruned_hypotheses = active_old[:prune_count]
+
+        for hypothesis in pruned_hypotheses:
+            hypothesis.is_active = False
+            hypothesis.review_verdict = "replaced_by_evolution"
+            hypothesis.review_comments = list(
+                dict.fromkeys(
+                    hypothesis.review_comments
+                    + [
+                        (
+                            "evolution_replacement_pruning: deactivated because each newly evolved idea "
+                            "replaces one low-ranked active idea."
+                        )
+                    ]
+                )
+            )
+
+        return StepResult(
+            name="evolution_replacement_pruning",
+            hypotheses=pruned_hypotheses,
+            data={
+                "new_active_evolved_count": target_prune_count,
+                "requested_prune_count": target_prune_count,
+                "pruned_count": len(pruned_hypotheses),
+                "active_old_available": len(active_old),
+                "pruned_hypotheses": [hypothesis.compact_summary() for hypothesis in pruned_hypotheses],
+                "policy": "prune_one_lowest_ranked_old_active_hypothesis_per_new_evolved_hypothesis",
+            },
+        )
 
     def _decay_low_elo_hypotheses(self, research_goal: ResearchGoal, context: ContextMemory) -> StepResult:
         active_hypotheses = sorted(

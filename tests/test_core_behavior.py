@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from app.agents import (
+    CodexRerankingAgent,
     EvolutionAgent,
     GenerationAgent,
     MetaReviewAgent,
@@ -34,11 +35,13 @@ import app.llm as llm_module
 from app.llm import call_llm
 from app.models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan
 from app.prompts import _serialize_literature, build_evolution_messages, build_generation_messages, build_meta_review_messages
+from app.reference import normalize_arxiv_reference
 from app.reports import build_markdown_report
 from app.tools.arxiv_search import ArxivSearchTool
 from app.tools.semantic_scholar import SemanticScholarSearchTool
 from app.trajectory import analyze_run_payload
 from app.utils import coerce_string_list, similarity_score
+from app.vector_index import PaperVectorIndex, paper_recall_text
 from app.workflow import SupervisorAgent
 
 
@@ -52,6 +55,12 @@ def _load_cli_module():
 
 
 class CoreBehaviorTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        sentence_model_patch = patch("app.utils.get_sentence_transformer_model", side_effect=RuntimeError("offline"))
+        sentence_model_patch.start()
+        self.addCleanup(sentence_model_patch.stop)
+
     def test_cli_missing_constraints_reports_clear_input_error(self):
         result = subprocess.run(
             [
@@ -59,6 +68,8 @@ class CoreBehaviorTests(unittest.TestCase):
                 "app.py",
                 "--goal",
                 "goal",
+                "--reference-arxiv",
+                "https://arxiv.org/abs/2502.18864",
                 "--constraints",
                 "run_configs/does_not_exist.json",
             ],
@@ -83,6 +94,8 @@ class CoreBehaviorTests(unittest.TestCase):
                     "app.py",
                     "--goal",
                     "goal",
+                    "--reference-arxiv",
+                    "https://arxiv.org/abs/2502.18864",
                     "--constraints",
                     str(bad_path),
                 ],
@@ -120,6 +133,8 @@ critic_llm:
                     str(repo_root / "app.py"),
                     "--goal",
                     "goal",
+                    "--reference-arxiv",
+                    "https://arxiv.org/abs/2502.18864",
                     "--cycles",
                     "1",
                 ],
@@ -224,6 +239,8 @@ critic_llm:
                 [
                     "--goal",
                     "resume goal",
+                    "--reference-arxiv",
+                    "https://arxiv.org/abs/2502.18864",
                     "--cycles",
                     "2",
                     "--output-dir",
@@ -259,7 +276,11 @@ critic_llm:
             )
             fake_supervisor = FakeSupervisor()
 
-            with patch.object(cli, "_require_llm_api_key"), patch.object(cli, "SupervisorAgent", return_value=fake_supervisor):
+            with patch.object(cli, "_require_llm_api_key"), patch.object(
+                cli,
+                "prepare_reference_paper",
+                return_value={"arxiv_id": "2502.18864", "arxiv_url": "https://arxiv.org/abs/2502.18864"},
+            ), patch.object(cli, "SupervisorAgent", return_value=fake_supervisor):
                 written = cli.run_cycles(args)
 
             report = json.loads(Path(written["json"]).read_text(encoding="utf-8"))
@@ -325,6 +346,18 @@ critic_llm:
         goal = ResearchGoal("goal", generation_temperature=0.9, evolution_temperature=0.65)
         self.assertEqual(goal.generation_temperature, 0.9)
         self.assertEqual(goal.evolution_temperature, 0.65)
+
+    def test_research_goal_signature_includes_reference_arxiv(self):
+        first = ResearchGoal("goal", reference_arxiv_url="https://arxiv.org/abs/2502.18864")
+        second = ResearchGoal("goal", reference_arxiv_url="https://arxiv.org/abs/2501.00001")
+
+        self.assertNotEqual(first.signature(), second.signature())
+
+    def test_normalize_arxiv_reference_accepts_url_and_id(self):
+        arxiv_id, url = normalize_arxiv_reference("https://arxiv.org/pdf/2502.18864v1")
+
+        self.assertEqual(arxiv_id, "2502.18864v1")
+        self.assertEqual(url, "https://arxiv.org/abs/2502.18864v1")
 
     def test_generation_temperature_cap_stays_below_overheated_range(self):
         goal = ResearchGoal("goal", generation_temperature=0.88)
@@ -766,7 +799,7 @@ critic_llm:
                 "short_summary": "Critic review.",
             },
         ) as mocked_review:
-            ReflectionAgent().initial_review([h1], goal, context)
+            ReflectionAgent().review_hypotheses([h1], goal, context)
 
         self.assertEqual(mocked_review.call_args.kwargs["profile"], "critic")
         self.assertEqual(mocked_review.call_args.kwargs["model"], "critic-model")
@@ -834,43 +867,6 @@ critic_llm:
         )
 
         self.assertEqual(budget, 10)
-
-    def test_specialized_review_updates_nested_artifacts(self):
-        hypothesis = Hypothesis("H1", "Title", "Hypothesis text")
-        payload = {
-            "correctness_score": 4,
-            "story_coherence_score": 5,
-            "short_summary": "Specialized summary",
-            "deep_verification": {
-                "invalidating_assumptions": ["Bad assumption"],
-                "non_fundamental_repairs": ["Repair it"],
-            },
-            "observation_review": {
-                "explained_observations": ["Observed A"],
-                "unexplained_or_contradictory_observations": ["Missing B"],
-            },
-            "simulation_review": {
-                "failure_scenarios": ["Fails under C"],
-                "protocol_risks": ["Risk D"],
-            },
-            "story_review": {
-                "combination_risk": "high",
-                "theory_gap": ["Add a sharper causal claim"],
-                "story_preserving_repair": ["Reframe around one mechanism"],
-            },
-        }
-
-        ReflectionAgent()._apply_specialized_review(hypothesis, payload)
-
-        self.assertIn("Bad assumption", hypothesis.failure_modes)
-        self.assertIn("Fails under C", hypothesis.failure_modes)
-        self.assertIn("Story review flagged high method-stacking risk.", hypothesis.failure_modes)
-        self.assertIn("Observed A", hypothesis.supporting_observations)
-        self.assertIn("Missing B", hypothesis.contradicting_observations)
-        self.assertIn("Add a sharper causal claim", hypothesis.improvement_actions)
-        self.assertIn("Reframe around one mechanism", hypothesis.improvement_actions)
-        self.assertEqual(hypothesis.scores["story_coherence"], 5.0)
-        self.assertEqual(hypothesis.specialized_reviews[-1]["short_summary"], "Specialized summary")
 
     def test_evolution_infers_parent_ids_when_model_omits_them(self):
         goal = ResearchGoal("goal", top_k_hypotheses=2, max_literature_results=0, evolution_temperature=0.6)
@@ -1115,7 +1111,7 @@ critic_llm:
         self.assertIn("method-stacking patterns", prompt)
         self.assertIn("frontier_storyline", prompt)
 
-    def test_full_review_reuses_seeded_and_parent_literature_for_evolved_hypotheses(self):
+    def test_unified_review_reuses_seeded_and_parent_literature_for_evolved_hypotheses(self):
         goal = ResearchGoal("goal", max_literature_results=3, reflection_temperature=0.3)
         context = ContextMemory()
         context.reset_for_goal(goal)
@@ -1157,7 +1153,7 @@ critic_llm:
                 "short_summary": "Grounded review.",
             },
         ):
-            result = ReflectionAgent().full_review([child], goal, context)
+            result = ReflectionAgent().review_hypotheses([child], goal, context)
 
         self.assertEqual(mocked_search.call_count, 0)
         self.assertEqual(len(result.data["literature_by_hypothesis"]["E1"]), 3)
@@ -1273,6 +1269,108 @@ critic_llm:
         self.assertEqual(result.data["audits"]["H1"]["status"], "skipped_unchanged")
         self.assertEqual(mocked_search.call_count, 0)
 
+    def test_paper_vector_index_persists_and_ranks_by_embedding(self):
+        class FakeEmbeddingModel:
+            def encode(self, texts, **_kwargs):
+                vectors = []
+                for text in texts:
+                    normalized = text.casefold()
+                    if "beta" in normalized:
+                        vectors.append([1.0, 0.0])
+                    elif "alpha" in normalized:
+                        vectors.append([0.0, 1.0])
+                    else:
+                        vectors.append([0.7, 0.3])
+                return vectors
+
+        notes = [
+            {"source": "arxiv", "arxiv_id": "1", "title": "Alpha Compression"},
+            {"source": "arxiv", "arxiv_id": "2", "title": "Beta Retrieval"},
+        ]
+        with TemporaryDirectory() as temp_dir, patch(
+            "app.vector_index.get_sentence_transformer_model",
+            return_value=FakeEmbeddingModel(),
+        ):
+            index_path = Path(temp_dir) / "prior_art_index.npz"
+            index = PaperVectorIndex(
+                index_path=index_path,
+                model_name="fake-model",
+                backend="numpy",
+                query_prefix="",
+                document_prefix="",
+            )
+            results = index.search("beta query", notes, top_k=1)
+            index_exists = index_path.exists()
+
+        self.assertEqual(results[0]["note"]["title"], "Beta Retrieval")
+        self.assertEqual(results[0]["vector_index_backend"], "numpy")
+        self.assertTrue(index_exists)
+
+    def test_prior_art_ranking_uses_vector_index_without_lexical_prefilter(self):
+        class FakeVectorIndex:
+            def __init__(self):
+                self.seen_corpus_sizes = []
+
+            def search(self, _query_text, notes, top_k):
+                self.seen_corpus_sizes.append(len(notes))
+                return [
+                    {
+                        "note": notes[1],
+                        "semantic_score": 0.91,
+                        "vector_rank": 1,
+                        "vector_index_backend": "fake",
+                    }
+                ][:top_k]
+
+        goal = ResearchGoal("goal", prior_art_embedding_candidates=1, prior_art_review_top_k=1)
+        hypothesis = Hypothesis("H1", "Target Idea", "Find semantic target paper.")
+        lexical_bait = {"source": "arxiv", "arxiv_id": "1", "title": "Target Idea lexical bait"}
+        semantic_target = {"source": "arxiv", "arxiv_id": "2", "title": "Semantic Match"}
+        fake_index = FakeVectorIndex()
+
+        with patch("app.agents.get_prior_art_vector_index", return_value=fake_index), patch(
+            "app.agents.lexical_similarity_score",
+            side_effect=lambda _left, right: 1.0 if "lexical bait" in right else 0.0,
+        ):
+            ranked = PriorArtAgent()._rank_prior_art(hypothesis, [lexical_bait, semantic_target], goal)
+
+        self.assertEqual(fake_index.seen_corpus_sizes, [2])
+        self.assertEqual(ranked[0]["title"], "Semantic Match")
+        self.assertEqual(ranked[0]["recall_score"], 0.91)
+
+    def test_prior_art_embedding_text_uses_title_abstract_only(self):
+        hypothesis = Hypothesis(
+            "H1",
+            "Compact Query",
+            "Core abstract sentence about the proposed method.",
+            mechanism="This mechanism should not be duplicated when text exists.",
+            rationale="This rationale should not be duplicated when text exists.",
+            predictions=["Prediction text should stay out of embedding queries."],
+            validation_experiments=["Experiment text should stay out of embedding queries."],
+        )
+
+        idea_text = PriorArtAgent()._idea_recall_text(hypothesis)
+        paper_text = paper_recall_text(
+            {
+                "title": "Compact Paper",
+                "abstract": "Paper abstract sentence.",
+                "citation": "Citation should stay out.",
+                "venue": "Venue should stay out.",
+            }
+        )
+
+        self.assertIn("Title: Compact Query", idea_text)
+        self.assertIn("Abstract: Core abstract sentence", idea_text)
+        self.assertNotIn("Mechanism:", idea_text)
+        self.assertNotIn("Novelty rationale:", idea_text)
+        self.assertNotIn("Prediction text", idea_text)
+        self.assertNotIn("Experiment text", idea_text)
+        self.assertNotIn("This mechanism should not be duplicated", idea_text)
+        self.assertIn("Title: Compact Paper", paper_text)
+        self.assertIn("Abstract: Paper abstract sentence.", paper_text)
+        self.assertNotIn("Citation should stay out", paper_text)
+        self.assertNotIn("Venue should stay out", paper_text)
+
     def test_prior_art_check_repairs_duplicate_and_rechecks_new_signature(self):
         goal = ResearchGoal(
             "goal",
@@ -1326,14 +1424,22 @@ critic_llm:
                 "search_queries": ["queue-aware gating transformer serving"],
             },
         }
+        vector_responses = [
+            [{"note": paper, "semantic_score": 0.9, "vector_rank": 1, "vector_index_backend": "fake"}],
+            [{"note": paper, "semantic_score": 0.1, "vector_rank": 1, "vector_index_backend": "fake"}],
+        ]
+
+        class FakeVectorIndex:
+            def search(self, _query_text, _notes, top_k):
+                return vector_responses.pop(0)
 
         with patch.object(agent, "_plan_literature_queries", return_value=["duplicate query"]), patch.object(
             agent.literature_service,
             "search_corpus",
             return_value=[paper],
-        ) as mocked_search, patch("app.agents.lexical_similarity_score", return_value=0.0), patch(
-            "app.agents.similarity_score",
-            side_effect=[0.9, 0.1],
+        ) as mocked_search, patch("app.agents.get_prior_art_vector_index", return_value=FakeVectorIndex()), patch(
+            "app.agents.lexical_similarity_score",
+            return_value=0.0,
         ), patch("app.agents.call_json", return_value=audit_payload) as mocked_call:
             result = agent.check_hypotheses([hypothesis], goal, context)
 
@@ -1722,18 +1828,21 @@ critic_llm:
 
         supervisor = SupervisorAgent()
         supervisor.generation_agent.generate_new_hypotheses = lambda *_: type("R", (), {"name": "generation", "hypotheses": [], "data": {}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": []}})()
-        supervisor.reflection_agent.initial_review = lambda *args, **kwargs: type("R", (), {"name": "initial_review", "hypotheses": [], "data": {}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": []}})()
-        supervisor.reflection_agent.full_review = lambda *args, **kwargs: type("R", (), {"name": "full_review", "hypotheses": [], "data": {}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": []}})()
-        supervisor.reflection_agent.specialized_review = lambda *args, **kwargs: type("R", (), {"name": "specialized_review", "hypotheses": [], "data": {"reviewed_count": 0}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": [], "reviewed_count": 0}})()
+        supervisor.reflection_agent.review_hypotheses = lambda *args, **kwargs: type("R", (), {"name": kwargs.get("step_name", "review"), "hypotheses": [], "data": {"reviewed_count": 0}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": [], "reviewed_count": 0}})()
         supervisor.proximity_agent.build_proximity_graph = lambda *args, **kwargs: type("R", (), {"name": kwargs.get("step_name", "proximity"), "hypotheses": [], "data": {"clusters": [], "duplicate_candidates": [], "adjacency_graph": {}}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": [], "clusters": [], "duplicate_candidates": [], "adjacency_graph": {}}})()
         supervisor.ranking_agent.run_tournament = lambda *args, **kwargs: type("R", (), {"name": kwargs.get("step_name", "ranking"), "hypotheses": [], "data": {"matches": [], "pairs_considered": 0, "skipped_cached_pairs": 0}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": [], "matches": [], "pairs_considered": 0, "skipped_cached_pairs": 0}})()
+        supervisor.codex_reranking_agent.rerank_top_hypotheses = lambda *args, **kwargs: type("R", (), {"name": kwargs.get("step_name", "codex_reranking"), "hypotheses": [], "data": {"status": "skipped"}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": [], "status": "skipped"}})()
         supervisor.evolution_agent.evolve_hypotheses = lambda *args, **kwargs: type("R", (), {"name": "evolution", "hypotheses": [], "data": {}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": []}})()
         supervisor.meta_review_agent.summarize_and_feedback = lambda *args, **kwargs: type("R", (), {"name": "meta_review", "hypotheses": [], "data": {"meta_review_critique": [], "research_overview": {}}, "errors": [], "duration": 0.0, "to_dict": lambda self: {"hypotheses": [], "meta_review_critique": [], "research_overview": {}}})()
 
         supervisor.run_cycle(goal, context, progress_callback=lambda step, *_: observed_steps.append(step))
 
         self.assertIn("generation", observed_steps)
+        self.assertIn("review", observed_steps)
+        self.assertIn("codex_reranking", observed_steps)
+        self.assertIn("evolution_replacement_pruning", observed_steps)
         self.assertIn("ranking_final", observed_steps)
+        self.assertIn("codex_reranking_final", observed_steps)
         self.assertIn("cycle_complete", observed_steps)
 
     def test_frontier_decay_prunes_lowest_elo_active_hypotheses(self):
@@ -1751,7 +1860,84 @@ critic_llm:
         self.assertFalse(context.hypotheses["H0"].is_active)
         self.assertFalse(context.hypotheses["H1"].is_active)
         self.assertEqual(context.hypotheses["H0"].review_verdict, "decayed_low_elo")
-        self.assertEqual(result.data["active_after"], 6)
+
+    def test_evolution_replacement_pruning_removes_one_old_idea_per_new_idea(self):
+        goal = ResearchGoal("goal", enable_safety_review=False)
+        context = ContextMemory()
+        context.reset_for_goal(goal)
+        old_hypotheses = [
+            Hypothesis("H1", "Old Low", "text", elo_score=1000),
+            Hypothesis("H2", "Old Mid", "text", elo_score=1010),
+            Hypothesis("H3", "Old High", "text", elo_score=1300),
+        ]
+        new_hypotheses = [
+            Hypothesis("E1", "New A", "text", origin="evolution", elo_score=1200),
+            Hypothesis("E2", "New B", "text", origin="evolution", elo_score=1200),
+        ]
+        for hypothesis in old_hypotheses + new_hypotheses:
+            context.add_hypothesis(hypothesis)
+
+        result = SupervisorAgent()._prune_replaced_hypotheses(goal, context, new_hypotheses)
+
+        self.assertEqual(result.data["pruned_count"], 2)
+        self.assertFalse(context.hypotheses["H1"].is_active)
+        self.assertFalse(context.hypotheses["H2"].is_active)
+        self.assertTrue(context.hypotheses["H3"].is_active)
+        self.assertTrue(context.hypotheses["E1"].is_active)
+        self.assertEqual(context.hypotheses["H1"].review_verdict, "replaced_by_evolution")
+
+    def test_codex_reranking_applies_returned_top4_order_and_records_evaluations(self):
+        goal = ResearchGoal(
+            "goal",
+            reference_arxiv_url="https://arxiv.org/abs/2502.18864",
+            reference_paper_context={"title": "Reference", "arxiv_url": "https://arxiv.org/abs/2502.18864"},
+            enable_safety_review=False,
+        )
+        context = ContextMemory()
+        context.reset_for_goal(goal)
+        context.research_plan = ResearchPlan.from_goal(goal)
+        for index, hypothesis_id in enumerate(["H1", "H2", "H3", "H4"], start=0):
+            context.add_hypothesis(
+                Hypothesis(hypothesis_id, f"Idea {hypothesis_id}", "text", elo_score=1300 - index * 10)
+            )
+        payload = {
+            "ranking": [
+                {"id": "H3", "rank": 1, "overall_score": 4.7, "summary": "Best differentiated idea."},
+                {"id": "H1", "rank": 2, "overall_score": 4.2},
+                {"id": "H2", "rank": 3, "overall_score": 3.8},
+                {"id": "H4", "rank": 4, "overall_score": 3.0},
+            ],
+            "evaluations": {
+                "H3": {
+                    "summary": "Strong but needs evidence.",
+                    "weaknesses": ["Needs a clearer baseline."],
+                    "novelty_risks": ["Adjacent to known routing work."],
+                    "feasibility_risks": ["May need costly experiments."],
+                    "recommended_action": "keep",
+                }
+            },
+            "overall_rationale": "H3 has the strongest gap.",
+        }
+
+        with patch(
+            "app.agents.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["codex"],
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            ),
+        ) as mocked_run:
+            result = CodexRerankingAgent().rerank_top_hypotheses(goal, context)
+
+        command = mocked_run.call_args.args[0]
+        self.assertEqual(command[:5], ["codex", "exec", "--yolo", "-m", "gpt-5.4"])
+        self.assertEqual(result.data["status"], "applied")
+        self.assertEqual(context.get_ranked_hypotheses()[0].hypothesis_id, "H3")
+        self.assertEqual(context.hypotheses["H3"].elo_score, 1300)
+        self.assertEqual(context.hypotheses["H3"].codex_rerank_reviews[-1]["rank"], 1)
+        self.assertIn("Needs a clearer baseline.", context.hypotheses["H3"].review_comments)
+        self.assertEqual(context.codex_rerank_history[-1]["overall_rationale"], "H3 has the strongest gap.")
 
     def test_frontier_decay_preserves_minimum_active_pool(self):
         goal = ResearchGoal("goal", top_k_hypotheses=4, hypothesis_decay_fraction=0.75, enable_safety_review=False)

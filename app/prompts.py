@@ -36,6 +36,28 @@ def _serialize_literature(literature_notes: List[Dict[str, Any]]) -> str:
     return _json_block({"literature": concise})
 
 
+def _serialize_reference(reference_paper: Dict[str, Any] | None) -> str:
+    if not isinstance(reference_paper, dict) or not reference_paper:
+        return _json_block({"reference_paper": {}})
+    return _json_block(
+        {
+            "reference_paper": {
+                "arxiv_id": reference_paper.get("arxiv_id"),
+                "arxiv_url": reference_paper.get("arxiv_url"),
+                "title": reference_paper.get("title"),
+                "concise_summary": reference_paper.get("concise_summary"),
+                "core_problem": reference_paper.get("core_problem"),
+                "core_mechanism": reference_paper.get("core_mechanism"),
+                "key_results": reference_paper.get("key_results", [])[:5],
+                "limitations": reference_paper.get("limitations", [])[:5],
+                "reusable_insights_for_new_ideas": reference_paper.get("reusable_insights_for_new_ideas", [])[:8],
+                "avoid_copying": reference_paper.get("avoid_copying", [])[:6],
+                "seed_queries": reference_paper.get("seed_queries", [])[:8],
+            }
+        }
+    )
+
+
 def _serialize_hypotheses(hypotheses: List[Dict[str, Any]], limit: int = 8) -> str:
     return _json_block({"hypotheses": hypotheses[:limit]})
 
@@ -51,6 +73,51 @@ def _serialize_feedback(meta_feedback: Dict[str, Any], research_overview: Dict[s
         "research_overview": research_overview or {},
     }
     return _json_block(payload)
+
+
+def build_reference_summary_messages(arxiv_id: str, arxiv_url: str, markdown_excerpt: str) -> List[Dict[str, str]]:
+    prompt = f"""
+Summarize this required reference paper for a downstream research-idea generation system.
+The downstream system will use the user's goal plus this reference paper to create new ideas.
+Do not propose new ideas yet. Extract reusable context, constraints, and search vocabulary.
+
+arXiv ID: {arxiv_id}
+arXiv URL: {arxiv_url}
+
+Paper Markdown excerpt:
+{markdown_excerpt}
+
+Requirements:
+- Capture the core problem, mechanism, and evidence in compact language.
+- Identify what can inspire new ideas without copying the paper's exact contribution.
+- Identify limitations and assumptions that future ideas can improve on.
+- Include seed queries useful for literature search.
+- If figure captions are present, summarize only the most important figures.
+
+Required JSON schema:
+{{
+  "title": "string",
+  "concise_summary": "string",
+  "core_problem": "string",
+  "core_mechanism": "string",
+  "key_results": ["string"],
+  "limitations": ["string"],
+  "reusable_insights_for_new_ideas": ["string"],
+  "avoid_copying": ["string"],
+  "seed_queries": ["string"],
+  "important_figures": [
+    {{
+      "label": "Figure/Table label",
+      "takeaway": "string",
+      "url": "string"
+    }}
+  ]
+}}
+"""
+    return [
+        {"role": "system", "content": BASE_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt.strip()},
+    ]
 
 
 def build_research_plan_messages(research_goal: str, constraints: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -348,87 +415,27 @@ Required JSON schema:
     ]
 
 
-def build_initial_review_messages(
+def build_unified_review_messages(
     research_goal: str,
     research_plan: Dict[str, Any],
-    hypothesis: Dict[str, Any],
-    meta_feedback: Dict[str, Any],
-) -> List[Dict[str, str]]:
-    prompt = f"""
-Perform a fast initial review of this hypothesis without external tools.
-This is a gate for whether the idea should advance to a more literature-grounded review.
-
-Research goal:
-{research_goal}
-
-Research plan:
-{_json_block(research_plan)}
-
-Hypothesis:
-{_json_block(hypothesis)}
-
-Recent meta-review feedback:
-{_json_block(meta_feedback or {})}
-
-Judge the hypothesis using the shared evaluation contract:
-- alignment with the goal
-- novelty
-- plausibility
-- testability
-- story coherence: whether the idea has a single problem-to-mechanism-to-prediction narrative
-- theoretical depth: whether it explains why the method should work beyond empirical trial-and-error
-- non-combination quality: whether any combined ingredients are necessary consequences of the story rather than a method stack
-- use "reject" only for ideas that are out of scope, fundamentally invalid, or not worth keeping in the tournament pool
-- use "revise" for a plausible idea that is only a combination of known methods until it gains a sharper theory/story
-
-Required JSON schema:
-{{
-  "alignment_score": 1,
-  "novelty_score": 1,
-  "plausibility_score": 1,
-  "feasibility_score": 1,
-  "testability_score": 1,
-  "story_coherence_score": 1,
-  "theoretical_depth_score": 1,
-  "non_combination_score": 1,
-  "verdict": "advance|revise|reject",
-  "short_summary": "string",
-  "strengths": ["string"],
-  "weaknesses": ["string"],
-  "critical_assumptions": ["string"],
-  "story_diagnosis": {{
-    "core_story": "string",
-    "combination_risk": "low|medium|high",
-    "missing_theory": ["string"],
-    "repair_to_story": ["string"]
-  }},
-  "improvement_actions": ["string"]
-}}
-"""
-    return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt.strip()},
-    ]
-
-
-def build_full_review_messages(
-    research_goal: str,
-    research_plan: Dict[str, Any],
+    reference_paper: Dict[str, Any],
     hypothesis: Dict[str, Any],
     literature_notes: List[Dict[str, Any]],
     tournament_history: List[Dict[str, Any]],
     meta_feedback: Dict[str, Any],
 ) -> List[Dict[str, str]]:
     prompt = f"""
-Perform a full review of this hypothesis using the literature notes as external grounding.
-Be concrete about support, contradictions, failure modes, and experiments.
-Also judge whether the hypothesis has a coherent paper story rather than a method-stack novelty claim.
+Review this hypothesis in one consolidated pass.
+Only do the useful parts: summarize the idea, reflect on whether it really works, identify weaknesses, judge feasibility, and decide whether it should be rejected.
 
-Research goal:
+Research goal and reference-paper context:
 {research_goal}
 
 Research plan:
 {_json_block(research_plan)}
+
+Required reference paper:
+{_serialize_reference(reference_paper)}
 
 Hypothesis:
 {_json_block(hypothesis)}
@@ -436,122 +443,37 @@ Hypothesis:
 Literature notes:
 {_serialize_literature(literature_notes)}
 
-Recent tournament history:
-{_json_block({"recent_matches": tournament_history[-6:]})}
-
-Recent meta-review feedback:
-{_json_block(meta_feedback or {})}
-
-Required JSON schema:
-{{
-  "alignment_score": 1,
-  "novelty_score": 1,
-  "plausibility_score": 1,
-  "feasibility_score": 1,
-  "correctness_score": 1,
-  "testability_score": 1,
-  "story_coherence_score": 1,
-  "theoretical_depth_score": 1,
-  "non_combination_score": 1,
-  "verdict": "advance|revise|reject",
-  "short_summary": "string",
-  "strengths": ["string"],
-  "weaknesses": ["string"],
-  "critical_assumptions": ["string"],
-  "story_diagnosis": {{
-    "core_story": "string",
-    "combination_risk": "low|medium|high",
-    "missing_theory": ["string"],
-    "repair_to_story": ["string"]
-  }},
-  "supporting_observations": ["string"],
-  "contradicting_observations": ["string"],
-  "failure_modes": ["string"],
-  "validation_experiments": ["string"],
-  "improvement_actions": ["string"],
-  "references": ["string"]
-}}
-"""
-    return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt.strip()},
-    ]
-
-
-def build_specialized_review_messages(
-    research_goal: str,
-    research_plan: Dict[str, Any],
-    hypothesis: Dict[str, Any],
-    literature_notes: List[Dict[str, Any]],
-    tournament_history: List[Dict[str, Any]],
-    meta_feedback: Dict[str, Any],
-) -> List[Dict[str, str]]:
-    prompt = f"""
-Perform the specialized Reflection-agent reviews for this hypothesis in one structured pass.
-Cover three review types:
-1. Deep verification: decompose assumptions into sub-assumptions and identify fundamental invalidating errors.
-2. Observation review: assess whether the hypothesis explains long-tail or under-explained observations in the literature.
-3. Simulation review: simulate the mechanism or proposed experiment step by step and summarize failure scenarios.
-4. Story review: assess whether the idea has a coherent theory/story, and whether any method combination is necessary rather than decorative.
-
-Research goal:
-{research_goal}
-
-Research plan:
-{_json_block(research_plan)}
-
-Hypothesis:
-{_json_block(hypothesis)}
-
-Literature notes:
-{_serialize_literature(literature_notes)}
-
-Recent tournament history:
+Recent tournament / reranking history:
 {_json_block({"recent_matches": tournament_history[-8:]})}
 
 Recent meta-review feedback:
 {_json_block(meta_feedback or {})}
 
+Decision policy:
+- Reject only if the idea is out of scope, clearly duplicative, fundamentally infeasible, or too vague to rescue.
+- Use revise when the idea is plausible but needs sharper mechanism, evidence, or experimental design.
+- Be explicit about how the required reference paper inspires the idea and where the idea must differ from that paper.
+- Do not produce long specialist subreviews. One concise consolidated review is enough.
+
 Required JSON schema:
 {{
-  "correctness_score": 1,
+  "alignment_score": 1,
+  "novelty_score": 1,
   "plausibility_score": 1,
+  "feasibility_score": 1,
   "testability_score": 1,
   "story_coherence_score": 1,
-  "theoretical_depth_score": 1,
-  "non_combination_score": 1,
   "verdict": "advance|revise|reject",
+  "reject": false,
+  "feasible": true,
   "short_summary": "string",
-  "deep_verification": {{
-    "assumption_tree": [
-      {{
-        "assumption": "string",
-        "sub_assumptions": ["string"],
-        "assessment": "supported|uncertain|contradicted",
-        "fundamental": true,
-        "reason": "string"
-      }}
-    ],
-    "invalidating_assumptions": ["string"],
-    "non_fundamental_repairs": ["string"]
-  }},
-  "observation_review": {{
-    "explained_observations": ["string"],
-    "unexplained_or_contradictory_observations": ["string"],
-    "needed_observations": ["string"]
-  }},
-  "simulation_review": {{
-    "simulation_trace": ["string"],
-    "failure_scenarios": ["string"],
-    "protocol_risks": ["string"]
-  }},
-  "story_review": {{
-    "core_story": "string",
-    "combination_risk": "low|medium|high",
-    "theory_gap": ["string"],
-    "story_preserving_repair": ["string"]
-  }},
+  "reflection": "string",
+  "feasibility_rationale": "string",
+  "reference_connection": "string",
+  "strengths": ["string"],
+  "weaknesses": ["string"],
   "failure_modes": ["string"],
+  "critical_assumptions": ["string"],
   "validation_experiments": ["string"],
   "improvement_actions": ["string"],
   "references": ["string"]

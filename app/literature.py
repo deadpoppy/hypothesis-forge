@@ -83,6 +83,16 @@ class LiteratureCache:
                             matches.append(paper)
         return dedupe_notes(matches)[:max_results]
 
+    def all_notes(self) -> List[Dict[str, Any]]:
+        matches = []
+        with self._lock:
+            entries = self._load().get("entries", {})
+            for entry in entries.values():
+                for paper in entry.get("papers", []):
+                    if isinstance(paper, dict):
+                        matches.append(paper)
+        return dedupe_notes(matches)
+
     def _entry_key(self, source: str, query: str) -> str:
         return f"{source}::{_normalize_query(query)}"
 
@@ -334,6 +344,9 @@ class LiteratureSearchService:
                     source_counts,
                 )
             all_notes.extend(live_notes)
+
+        if bool(config.get("prior_art_include_cache_corpus", True)):
+            all_notes.extend(self.cache.all_notes())
 
         deduped = dedupe_notes(all_notes)
         if max_total is not None:

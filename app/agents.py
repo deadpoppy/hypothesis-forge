@@ -5,27 +5,28 @@ import hashlib
 import json
 import itertools
 import math
+import re
+import subprocess
 import time
 from typing import Any, Dict, List, Sequence, Tuple
 
+from .config import config
 from .llm import LLMCallError, call_json
 from .literature import dedupe_notes, get_literature_service
 from .models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan, StepResult
 from .prompts import (
     build_evolution_refill_messages,
     build_evolution_messages,
-    build_full_review_messages,
     build_generation_refill_messages,
     build_generation_messages,
     build_goal_safety_review_messages,
-    build_initial_review_messages,
     build_literature_query_planning_messages,
     build_meta_review_messages,
     build_prior_art_audit_messages,
     build_ranking_messages,
     build_ranking_reaudit_messages,
     build_research_plan_messages,
-    build_specialized_review_messages,
+    build_unified_review_messages,
 )
 from .utils import (
     coerce_string_list,
@@ -37,6 +38,7 @@ from .utils import (
     run_concurrently,
     similarity_score,
 )
+from .vector_index import get_prior_art_vector_index, paper_recall_text, title_abstract_recall_text
 
 
 def _compose_hypothesis_text(payload: Dict[str, Any]) -> str:
@@ -101,6 +103,8 @@ def _build_review_artifact(hypothesis: Hypothesis) -> Dict[str, Any]:
         "weaknesses": hypothesis.failure_modes[:4] + hypothesis.improvement_actions[:4],
         "validation_experiments": hypothesis.validation_experiments[:4],
         "references": hypothesis.references[:5],
+        "latest_review": hypothesis.review_artifacts[-1] if hypothesis.review_artifacts else {},
+        "latest_codex_rerank": hypothesis.codex_rerank_reviews[-1] if hypothesis.codex_rerank_reviews else {},
     }
 
 
@@ -657,6 +661,7 @@ class LiteratureMixin:
             queries.append(hypothesis.title)
             queries.extend(_focus_area_query_variants(hypothesis.focus_area))
         queries.extend(research_plan.seed_queries)
+        queries.extend(research_goal.reference_seed_queries())
         queries.append(research_goal.description)
         return dedupe_preserve_order(queries)
 
@@ -677,6 +682,13 @@ class LiteratureMixin:
             return []
 
         search_context: Dict[str, Any] = {"step": step_name}
+        if research_goal.reference_paper_context:
+            search_context["reference_paper"] = {
+                "title": research_goal.reference_paper_context.get("title"),
+                "core_problem": research_goal.reference_paper_context.get("core_problem"),
+                "core_mechanism": research_goal.reference_paper_context.get("core_mechanism"),
+                "seed_queries": research_goal.reference_paper_context.get("seed_queries", [])[:6],
+            }
         if context is not None:
             search_context["iteration_number"] = context.iteration_number
             search_context["latest_meta_review"] = context.latest_meta_review()
@@ -687,7 +699,7 @@ class LiteratureMixin:
             payload = _coerce_mapping(
                 call_json(
                     build_literature_query_planning_messages(
-                        research_goal=research_goal.description,
+                        research_goal=research_goal.prompt_context(),
                         research_plan=research_plan.to_dict(),
                         search_context=search_context,
                         candidate_queries=raw_queries,
@@ -739,7 +751,7 @@ class SafetyReviewAgent:
         try:
             payload = _coerce_mapping(
                 call_json(
-                    build_goal_safety_review_messages(research_goal.description, research_goal.constraints),
+                    build_goal_safety_review_messages(research_goal.prompt_context(), research_goal.constraints),
                     model=research_goal.critic_llm_model,
                     temperature=0.1,
                     profile="critic",
@@ -809,7 +821,7 @@ class ResearchPlanAgent:
         fallback = ResearchPlan.from_goal(research_goal)
         try:
             payload = call_json(
-                build_research_plan_messages(research_goal.description, research_goal.constraints),
+                build_research_plan_messages(research_goal.prompt_context(), research_goal.constraints),
                 model=research_goal.llm_model,
                 temperature=0.2,
                 profile="thinking",
@@ -908,7 +920,7 @@ class GenerationAgent(LiteratureMixin):
         try:
             payload = call_json(
                 build_generation_messages(
-                    research_goal=research_goal.description,
+                    research_goal=research_goal.prompt_context(),
                     research_plan=research_plan.to_dict(),
                     context_hypotheses=context_memory,
                     literature_notes=literature_notes,
@@ -950,7 +962,7 @@ class GenerationAgent(LiteratureMixin):
             try:
                 refill_payload = call_json(
                     build_generation_refill_messages(
-                        research_goal=research_goal.description,
+                        research_goal=research_goal.prompt_context(),
                         research_plan=research_plan.to_dict(),
                         accepted_hypotheses=[hypothesis.compact_summary() for hypothesis in new_hypotheses],
                         literature_notes=literature_notes,
@@ -1096,6 +1108,7 @@ class PriorArtAgent(LiteratureMixin):
                 "query_budget": research_goal.prior_art_queries_per_idea,
                 "results_per_query": research_goal.prior_art_results_per_query,
                 "embedding_candidates": research_goal.prior_art_embedding_candidates,
+                "retrieval_mode": "vector_index_embedding",
                 "review_top_k": research_goal.prior_art_review_top_k,
                 "similarity_threshold": research_goal.prior_art_similarity_threshold,
             },
@@ -1161,7 +1174,7 @@ class PriorArtAgent(LiteratureMixin):
                 audit_payload = _coerce_mapping(
                     call_json(
                         build_prior_art_audit_messages(
-                            research_goal=research_goal.description,
+                            research_goal=research_goal.prompt_context(),
                             research_plan=research_plan.to_dict(),
                             hypothesis=hypothesis.to_dict(),
                             similar_papers=audit_papers,
@@ -1239,59 +1252,85 @@ class PriorArtAgent(LiteratureMixin):
         research_goal: ResearchGoal,
     ) -> List[Dict[str, Any]]:
         idea_text = self._idea_recall_text(hypothesis)
-        lexical_ranked = []
-        for index, note in enumerate(corpus_notes):
+        candidate_limit = max(research_goal.prior_art_embedding_candidates, research_goal.prior_art_review_top_k)
+        try:
+            vector_results = get_prior_art_vector_index().search(
+                idea_text,
+                corpus_notes,
+                top_k=candidate_limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Prior-art vector recall failed; falling back to direct embedding scan: %s", exc)
+            vector_results = self._direct_embedding_rank(idea_text, corpus_notes, candidate_limit)
+
+        scored = []
+        for result in vector_results:
+            note = result.get("note", {})
+            if not isinstance(note, dict):
+                continue
             paper_text = self._paper_recall_text(note)
             lexical_score = max(
                 lexical_similarity_score(idea_text, paper_text),
                 lexical_similarity_score(hypothesis.title, str(note.get("title") or "")),
             )
-            lexical_ranked.append((lexical_score, -index, note, paper_text))
-
-        lexical_ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        prefiltered = lexical_ranked[: research_goal.prior_art_embedding_candidates]
-        scored = []
-        for lexical_score, _index, note, paper_text in prefiltered:
-            semantic_score = similarity_score(idea_text, paper_text)
-            recall_score = max(float(lexical_score), float(semantic_score))
+            semantic_score = float(result.get("semantic_score", 0.0))
             scored.append(
                 {
                     **self._paper_for_audit(note),
                     "lexical_score": _round_score(float(lexical_score)),
                     "semantic_score": _round_score(float(semantic_score)),
-                    "recall_score": _round_score(recall_score),
+                    "recall_score": _round_score(semantic_score),
+                    "vector_rank": result.get("vector_rank"),
+                    "vector_index_backend": result.get("vector_index_backend"),
                 }
             )
 
         scored.sort(key=lambda item: item.get("recall_score", 0.0), reverse=True)
         return scored
 
+    def _direct_embedding_rank(
+        self,
+        idea_text: str,
+        corpus_notes: Sequence[Dict[str, Any]],
+        candidate_limit: int,
+    ) -> List[Dict[str, Any]]:
+        scored = []
+        for note in dedupe_notes(corpus_notes):
+            paper_text = self._paper_recall_text(note)
+            semantic_score = similarity_score(idea_text, paper_text)
+            scored.append(
+                {
+                    "note": note,
+                    "semantic_score": semantic_score,
+                    "vector_rank": None,
+                    "vector_index_backend": "direct_scan",
+                }
+            )
+        scored.sort(key=lambda item: item.get("semantic_score", 0.0), reverse=True)
+        for rank, item in enumerate(scored, start=1):
+            item["vector_rank"] = rank
+        return scored[:candidate_limit]
+
     def _idea_recall_text(self, hypothesis: Hypothesis) -> str:
-        parts = [
+        abstract = hypothesis.text.strip()
+        if not abstract:
+            abstract = " ".join(
+                part
+                for part in [
+                    hypothesis.problem_framing,
+                    hypothesis.central_insight,
+                    hypothesis.mechanism,
+                    hypothesis.rationale,
+                ]
+                if str(part).strip()
+            )
+        return title_abstract_recall_text(
             hypothesis.title,
-            hypothesis.text,
-            hypothesis.focus_area,
-            hypothesis.primary_bottleneck,
-            hypothesis.mechanism,
-            hypothesis.problem_framing,
-            hypothesis.central_insight,
-            hypothesis.theoretical_story,
-            hypothesis.why_not_simple_combination,
-            hypothesis.rationale,
-            " ".join(hypothesis.predictions),
-            " ".join(hypothesis.validation_experiments),
-        ]
-        return "\n".join(part for part in parts if str(part).strip())
+            abstract,
+        )
 
     def _paper_recall_text(self, note: Dict[str, Any]) -> str:
-        parts = [
-            note.get("title"),
-            note.get("summary"),
-            note.get("abstract"),
-            note.get("citation"),
-            note.get("venue"),
-        ]
-        return "\n".join(str(part) for part in parts if str(part or "").strip())
+        return paper_recall_text(note)
 
     def _paper_for_audit(self, note: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -1539,49 +1578,17 @@ class ReflectionAgent(LiteratureMixin):
 
         return dedupe_notes(seeded_notes)[:max_results]
 
-    def initial_review(self, hypotheses: List[Hypothesis], research_goal: ResearchGoal, context: ContextMemory) -> StepResult:
+    def review_hypotheses(
+        self,
+        hypotheses: List[Hypothesis],
+        research_goal: ResearchGoal,
+        context: ContextMemory,
+        step_name: str = "review",
+    ) -> StepResult:
         start_time = time.time()
         research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
         meta_feedback = context.latest_meta_review()
-
-        def review_one(hypothesis: Hypothesis) -> Tuple[Hypothesis, Dict[str, Any], str | None]:
-            try:
-                payload = _coerce_mapping(call_json(
-                    build_initial_review_messages(
-                        research_goal=research_goal.description,
-                        research_plan=research_plan.to_dict(),
-                        hypothesis=hypothesis.to_dict(),
-                        meta_feedback=meta_feedback,
-                    ),
-                    model=research_goal.critic_llm_model,
-                    temperature=max(0.1, research_goal.reflection_temperature - 0.1),
-                    profile="critic",
-                ), self._fallback_review(hypothesis))
-                return hypothesis, payload, None
-            except LLMCallError as exc:
-                return hypothesis, self._fallback_review(hypothesis), f"{hypothesis.hypothesis_id}: {exc}"
-
-        errors: List[str] = []
-        reviews = []
-        results = run_concurrently(hypotheses, review_one, max_workers=research_goal.max_concurrency)
-        for hypothesis, payload, error in results:
-            if error:
-                errors.append(error)
-            hypothesis.apply_review(payload, stage_label="initial_review")
-            reviews.append({"id": hypothesis.hypothesis_id, **payload})
-
-        return StepResult(
-            name="initial_review",
-            hypotheses=hypotheses,
-            data={"reviews": reviews},
-            errors=errors,
-            duration=time.time() - start_time,
-        )
-
-    def full_review(self, hypotheses: List[Hypothesis], research_goal: ResearchGoal, context: ContextMemory) -> StepResult:
-        start_time = time.time()
-        research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
-        meta_feedback = context.latest_meta_review()
+        reference_paper = context.reference_paper_context or research_goal.reference_paper_context
 
         def review_one(hypothesis: Hypothesis) -> Tuple[Hypothesis, Dict[str, Any], List[Dict[str, Any]], str | None]:
             seeded_notes = self._seed_literature_for_review(hypothesis, context, research_goal.max_literature_results)
@@ -1594,7 +1601,7 @@ class ReflectionAgent(LiteratureMixin):
                     research_goal,
                     research_plan,
                     raw_literature_queries,
-                    step_name="full_review",
+                    step_name=step_name,
                     query_budget=query_budget,
                     context=context,
                     hypothesis=hypothesis,
@@ -1602,18 +1609,19 @@ class ReflectionAgent(LiteratureMixin):
                 searched_notes = self._search_literature(
                     literature_queries,
                     remaining_slots,
-                    sample_seed=self._literature_sample_seed(research_goal, "full_review", context, hypothesis),
+                    sample_seed=self._literature_sample_seed(research_goal, step_name, context, hypothesis),
                 )
                 literature_notes = dedupe_notes(seeded_notes + searched_notes)[: research_goal.max_literature_results]
 
             try:
                 payload = _coerce_mapping(call_json(
-                    build_full_review_messages(
-                        research_goal=research_goal.description,
+                    build_unified_review_messages(
+                        research_goal=research_goal.prompt_context(),
                         research_plan=research_plan.to_dict(),
+                        reference_paper=reference_paper,
                         hypothesis=hypothesis.to_dict(),
                         literature_notes=literature_notes,
-                        tournament_history=context.tournament_results,
+                        tournament_history=context.tournament_results + context.codex_rerank_history,
                         meta_feedback=meta_feedback,
                     ),
                     model=research_goal.critic_llm_model,
@@ -1633,152 +1641,22 @@ class ReflectionAgent(LiteratureMixin):
                 errors.append(error)
             hypothesis.literature_notes = literature_notes
             literature_by_hypothesis[hypothesis.hypothesis_id] = literature_notes
-            hypothesis.apply_review(payload, stage_label="full_review")
+            hypothesis.apply_review(payload, stage_label=step_name)
+            hypothesis.review_artifacts.append(payload)
             reviews.append({"id": hypothesis.hypothesis_id, **payload})
 
         return StepResult(
-            name="full_review",
+            name=step_name,
             hypotheses=hypotheses,
-            data={"reviews": reviews, "literature_by_hypothesis": literature_by_hypothesis},
+            data={
+                "reviews": reviews,
+                "literature_by_hypothesis": literature_by_hypothesis,
+                "reviewed_count": len(reviews),
+                "eligible_count": len([hypothesis for hypothesis in hypotheses if hypothesis.is_active]),
+            },
             errors=errors,
             duration=time.time() - start_time,
         )
-
-    def specialized_review(self, hypotheses: List[Hypothesis], research_goal: ResearchGoal, context: ContextMemory) -> StepResult:
-        start_time = time.time()
-        research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
-        meta_feedback = context.latest_meta_review()
-        candidates = [hypothesis for hypothesis in hypotheses if hypothesis.is_active]
-        candidates = sorted(candidates, key=lambda hypothesis: hypothesis.elo_score, reverse=True)[: research_goal.deep_review_top_k]
-
-        def review_one(hypothesis: Hypothesis) -> Tuple[Hypothesis, Dict[str, Any], List[Dict[str, Any]], str | None]:
-            literature_notes = hypothesis.literature_notes
-            if not literature_notes:
-                raw_literature_queries = self._build_queries(research_goal, research_plan, hypothesis)
-                literature_queries = self._plan_literature_queries(
-                    research_goal,
-                    research_plan,
-                    raw_literature_queries,
-                    step_name="specialized_review",
-                    query_budget=3,
-                    context=context,
-                    hypothesis=hypothesis,
-                )
-                literature_notes = self._search_literature(
-                    literature_queries,
-                    research_goal.max_literature_results,
-                    sample_seed=self._literature_sample_seed(research_goal, "specialized_review", context, hypothesis),
-                )
-
-            try:
-                payload = _coerce_mapping(
-                    call_json(
-                        build_specialized_review_messages(
-                            research_goal=research_goal.description,
-                            research_plan=research_plan.to_dict(),
-                            hypothesis=hypothesis.to_dict(),
-                            literature_notes=literature_notes,
-                            tournament_history=context.tournament_results,
-                            meta_feedback=meta_feedback,
-                        ),
-                        model=research_goal.critic_llm_model,
-                        temperature=research_goal.reflection_temperature,
-                        profile="critic",
-                    ),
-                    self._fallback_specialized_review(hypothesis),
-                )
-                return hypothesis, payload, literature_notes, None
-            except LLMCallError as exc:
-                return hypothesis, self._fallback_specialized_review(hypothesis), literature_notes, f"{hypothesis.hypothesis_id}: {exc}"
-
-        errors: List[str] = []
-        reviews = []
-        results = run_concurrently(candidates, review_one, max_workers=research_goal.max_concurrency)
-        for hypothesis, payload, literature_notes, error in results:
-            if error:
-                errors.append(error)
-            hypothesis.literature_notes = literature_notes
-            self._apply_specialized_review(hypothesis, payload)
-            reviews.append({"id": hypothesis.hypothesis_id, **payload})
-
-        return StepResult(
-            name="specialized_review",
-            hypotheses=candidates,
-            data={"reviews": reviews, "reviewed_count": len(candidates), "eligible_count": len([h for h in hypotheses if h.is_active])},
-            errors=errors,
-            duration=time.time() - start_time,
-        )
-
-    def _apply_specialized_review(self, hypothesis: Hypothesis, payload: Dict[str, Any]) -> None:
-        hypothesis.apply_review(payload, stage_label="specialized_review")
-        deep_verification = _coerce_mapping(payload.get("deep_verification"), {})
-        observation_review = _coerce_mapping(payload.get("observation_review"), {})
-        simulation_review = _coerce_mapping(payload.get("simulation_review"), {})
-        story_review = _coerce_mapping(payload.get("story_review"), {})
-
-        hypothesis.failure_modes = dedupe_preserve_order(
-            hypothesis.failure_modes
-            + coerce_string_list(deep_verification.get("invalidating_assumptions", []))
-            + coerce_string_list(simulation_review.get("failure_scenarios", []))
-            + coerce_string_list(simulation_review.get("protocol_risks", []))
-        )
-        combination_risk = str(story_review.get("combination_risk") or "").strip().lower()
-        if combination_risk in {"medium", "high"}:
-            hypothesis.failure_modes = dedupe_preserve_order(
-                hypothesis.failure_modes + [f"Story review flagged {combination_risk} method-stacking risk."]
-            )
-        hypothesis.supporting_observations = dedupe_preserve_order(
-            hypothesis.supporting_observations + coerce_string_list(observation_review.get("explained_observations", []))
-        )
-        hypothesis.contradicting_observations = dedupe_preserve_order(
-            hypothesis.contradicting_observations
-            + coerce_string_list(observation_review.get("unexplained_or_contradictory_observations", []))
-        )
-        hypothesis.improvement_actions = dedupe_preserve_order(
-            hypothesis.improvement_actions
-            + coerce_string_list(deep_verification.get("non_fundamental_repairs", []))
-            + coerce_string_list(observation_review.get("needed_observations", []))
-            + coerce_string_list(story_review.get("theory_gap", []))
-            + coerce_string_list(story_review.get("story_preserving_repair", []))
-        )
-        hypothesis.specialized_reviews.append(payload)
-
-    def _fallback_specialized_review(self, hypothesis: Hypothesis) -> Dict[str, Any]:
-        return {
-            "correctness_score": hypothesis.scores.get("correctness", hypothesis.scores.get("alignment", 3)),
-            "plausibility_score": hypothesis.scores.get("plausibility", hypothesis.scores.get("feasibility", 3)),
-            "testability_score": hypothesis.scores.get("testability", 3),
-            "story_coherence_score": hypothesis.scores.get("story_coherence", 3),
-            "theoretical_depth_score": hypothesis.scores.get("theoretical_depth", 3),
-            "non_combination_score": hypothesis.scores.get("non_combination", 3),
-            "verdict": hypothesis.review_verdict or "revise",
-            "short_summary": hypothesis.review_summary or hypothesis.text[:220],
-            "deep_verification": {
-                "assumption_tree": [],
-                "invalidating_assumptions": [],
-                "non_fundamental_repairs": ["Retry specialized review with stronger literature grounding."],
-            },
-            "observation_review": {
-                "explained_observations": [],
-                "unexplained_or_contradictory_observations": [],
-                "needed_observations": [],
-            },
-            "simulation_review": {
-                "simulation_trace": [],
-                "failure_scenarios": hypothesis.failure_modes[:3],
-                "protocol_risks": [],
-            },
-            "story_review": {
-                "core_story": hypothesis.theoretical_story or hypothesis.mechanism,
-                "combination_risk": "medium" if hypothesis.generation_strategy == "combination" else "low",
-                "theory_gap": [],
-                "story_preserving_repair": ["Retry specialized story review with stronger literature grounding."],
-            },
-            "failure_modes": hypothesis.failure_modes[:4],
-            "validation_experiments": hypothesis.validation_experiments[:4],
-            "improvement_actions": ["Manual deep verification is needed because automatic specialized review failed."],
-            "references": hypothesis.references[:5],
-        }
 
     def _fallback_review(self, hypothesis: Hypothesis) -> Dict[str, Any]:
         summary = hypothesis.text[:220]
@@ -1793,7 +1671,12 @@ class ReflectionAgent(LiteratureMixin):
             "theoretical_depth_score": 3,
             "non_combination_score": 3,
             "verdict": "revise",
+            "reject": False,
+            "feasible": True,
             "short_summary": summary,
+            "reflection": "Automatic review failed, so this hypothesis needs manual reflection before being trusted.",
+            "feasibility_rationale": "No fatal feasibility issue was proven by the fallback path.",
+            "reference_connection": "",
             "strengths": ["Fallback review used because the structured LLM review failed."],
             "weaknesses": ["Needs manual inspection because automatic review failed."],
             "critical_assumptions": hypothesis.key_assumptions[:3],
@@ -1979,7 +1862,7 @@ class RankingAgent:
             try:
                 if should_reaudit:
                     messages = build_ranking_reaudit_messages(
-                        research_goal=research_goal.description,
+                        research_goal=research_goal.prompt_context(),
                         research_plan=research_plan.to_dict(),
                         hypothesis_a=hypothesis_a.to_dict(),
                         hypothesis_b=hypothesis_b.to_dict(),
@@ -1990,7 +1873,7 @@ class RankingAgent:
                     adjudication_source = "cache_reaudit"
                 else:
                     messages = build_ranking_messages(
-                        research_goal=research_goal.description,
+                        research_goal=research_goal.prompt_context(),
                         research_plan=research_plan.to_dict(),
                         hypothesis_a=hypothesis_a.to_dict(),
                         hypothesis_b=hypothesis_b.to_dict(),
@@ -2504,6 +2387,251 @@ class RankingAgent:
         loser.elo_score += k_factor * (0 - expected_loser)
 
 
+class CodexRerankingAgent:
+    """Use Codex CLI search/reasoning to rerank the current top-four ideas."""
+
+    def rerank_top_hypotheses(
+        self,
+        research_goal: ResearchGoal,
+        context: ContextMemory,
+        step_name: str = "codex_reranking",
+        top_n: int = 4,
+    ) -> StepResult:
+        start_time = time.time()
+        active = [hypothesis for hypothesis in context.get_ranked_hypotheses() if hypothesis.is_active]
+        candidates = active[:top_n]
+        if len(candidates) < 2:
+            return StepResult(
+                name=step_name,
+                hypotheses=candidates,
+                data={"status": "skipped", "reason": "fewer_than_two_active_hypotheses"},
+                duration=time.time() - start_time,
+            )
+        if not bool(config.get("enable_codex_reranking", True)):
+            return StepResult(
+                name=step_name,
+                hypotheses=candidates,
+                data={"status": "disabled"},
+                duration=time.time() - start_time,
+            )
+
+        model = str(config.get("codex_rerank_model") or "gpt-5.4")
+        timeout = int(config.get("codex_rerank_timeout_seconds", 900) or 900)
+        prompt = self._build_prompt(research_goal, context, candidates)
+        command = ["codex", "exec", "--yolo", "-m", model, prompt]
+        errors: List[str] = []
+        raw_stdout = ""
+        raw_stderr = ""
+        payload: Dict[str, Any] = {}
+
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            raw_stdout = completed.stdout or ""
+            raw_stderr = completed.stderr or ""
+            if completed.returncode != 0:
+                errors.append(f"codex exec exited with {completed.returncode}: {(raw_stderr or raw_stdout)[:1200]}")
+            else:
+                payload = self._parse_json_payload(raw_stdout)
+                if not payload:
+                    errors.append("codex exec returned no parseable JSON payload.")
+        except subprocess.TimeoutExpired as exc:
+            errors.append(f"codex exec timed out after {timeout}s: {exc}")
+        except OSError as exc:
+            errors.append(f"could not run codex exec: {exc}")
+
+        normalized = self._normalize_payload(payload, candidates)
+        if payload and normalized["ranking"]:
+            self._apply_ranking(candidates, normalized)
+            status = "applied"
+        else:
+            status = "fallback_current_order"
+
+        record = {
+            "iteration": context.iteration_number + 1,
+            "step": step_name,
+            "status": status,
+            "model": model,
+            "ranking": normalized["ranking"],
+            "evaluations": normalized["evaluations"],
+            "overall_rationale": str(payload.get("overall_rationale") or "").strip() if isinstance(payload, dict) else "",
+        }
+        context.codex_rerank_history.append(record)
+
+        ranked_candidates = sorted(candidates, key=lambda hypothesis: hypothesis.elo_score, reverse=True)
+        return StepResult(
+            name=step_name,
+            hypotheses=ranked_candidates,
+            data={
+                **record,
+                "command": f"codex exec --yolo -m {model}",
+                "candidate_ids": [hypothesis.hypothesis_id for hypothesis in candidates],
+                "stdout_tail": raw_stdout[-2000:],
+                "stderr_tail": raw_stderr[-2000:],
+            },
+            errors=errors,
+            duration=time.time() - start_time,
+        )
+
+    def _build_prompt(self, research_goal: ResearchGoal, context: ContextMemory, candidates: Sequence[Hypothesis]) -> str:
+        research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
+        payload = {
+            "task": "Rerank the current top-four research ideas.",
+            "instructions": [
+                "Use your paper search ability where useful before judging novelty and risks.",
+                "Compare each idea against the user's goal and the required reference paper.",
+                "For every idea, store detailed critique: novelty risk, feasibility risk, evidence gap, and whether to keep it.",
+                "Prefer ideas that are inspired by the reference paper but do not copy its exact contribution.",
+                "Return strict JSON only, with no markdown or commentary outside JSON.",
+            ],
+            "research_goal": research_goal.prompt_context(),
+            "research_plan": research_plan.to_dict(),
+            "reference_paper": context.reference_paper_context or research_goal.reference_paper_context,
+            "candidates": [hypothesis.to_dict() for hypothesis in candidates],
+            "required_schema": {
+                "ranking": [
+                    {
+                        "id": "hypothesis id",
+                        "rank": 1,
+                        "overall_score": 0.0,
+                        "keep": True,
+                        "summary": "short judgment",
+                    }
+                ],
+                "evaluations": {
+                    "hypothesis id": {
+                        "summary": "string",
+                        "strengths": ["string"],
+                        "weaknesses": ["string"],
+                        "novelty_risks": ["string"],
+                        "feasibility_risks": ["string"],
+                        "literature_notes": ["string"],
+                        "reference_connection": "string",
+                        "recommended_action": "keep|revise|drop",
+                    }
+                },
+                "overall_rationale": "string",
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _parse_json_payload(self, text: str) -> Dict[str, Any]:
+        stripped = text.strip()
+        if not stripped:
+            return {}
+        try:
+            payload = json.loads(stripped)
+            return payload if isinstance(payload, dict) else {}
+        except json.JSONDecodeError:
+            pass
+
+        code_block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL)
+        if code_block:
+            try:
+                payload = json.loads(code_block.group(1))
+                return payload if isinstance(payload, dict) else {}
+            except json.JSONDecodeError:
+                pass
+
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                payload = json.loads(stripped[start : end + 1])
+                return payload if isinstance(payload, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def _normalize_payload(self, payload: Dict[str, Any], candidates: Sequence[Hypothesis]) -> Dict[str, Any]:
+        candidate_ids = [hypothesis.hypothesis_id for hypothesis in candidates]
+        seen: set[str] = set()
+        ranking: List[Dict[str, Any]] = []
+        raw_ranking = payload.get("ranking") if isinstance(payload, dict) else []
+        if isinstance(raw_ranking, list):
+            for item in raw_ranking:
+                hypothesis_id = ""
+                if isinstance(item, dict):
+                    hypothesis_id = str(item.get("id") or item.get("hypothesis_id") or "").strip()
+                elif item:
+                    hypothesis_id = str(item).strip()
+                if hypothesis_id not in candidate_ids or hypothesis_id in seen:
+                    continue
+                seen.add(hypothesis_id)
+                ranking.append(
+                    {
+                        "id": hypothesis_id,
+                        "rank": len(ranking) + 1,
+                        "overall_score": self._coerce_float(item.get("overall_score") if isinstance(item, dict) else None),
+                        "keep": bool(item.get("keep", True)) if isinstance(item, dict) else True,
+                        "summary": str(item.get("summary") or "").strip() if isinstance(item, dict) else "",
+                    }
+                )
+        for hypothesis_id in candidate_ids:
+            if hypothesis_id not in seen:
+                ranking.append({"id": hypothesis_id, "rank": len(ranking) + 1, "overall_score": 0.0, "keep": True, "summary": ""})
+
+        raw_evaluations = payload.get("evaluations") if isinstance(payload, dict) else {}
+        evaluations: Dict[str, Dict[str, Any]] = {}
+        for hypothesis_id in candidate_ids:
+            evaluation = raw_evaluations.get(hypothesis_id, {}) if isinstance(raw_evaluations, dict) else {}
+            if not isinstance(evaluation, dict):
+                evaluation = {}
+            evaluations[hypothesis_id] = {
+                "summary": str(evaluation.get("summary") or "").strip(),
+                "strengths": coerce_string_list(evaluation.get("strengths", [])),
+                "weaknesses": coerce_string_list(evaluation.get("weaknesses", [])),
+                "novelty_risks": coerce_string_list(evaluation.get("novelty_risks", [])),
+                "feasibility_risks": coerce_string_list(evaluation.get("feasibility_risks", [])),
+                "literature_notes": coerce_string_list(evaluation.get("literature_notes", [])),
+                "reference_connection": str(evaluation.get("reference_connection") or "").strip(),
+                "recommended_action": str(evaluation.get("recommended_action") or "revise").strip().lower(),
+            }
+        return {"ranking": ranking, "evaluations": evaluations}
+
+    def _coerce_float(self, value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _apply_ranking(self, candidates: Sequence[Hypothesis], normalized: Dict[str, Any]) -> None:
+        by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in candidates}
+        original_elo_values = sorted([hypothesis.elo_score for hypothesis in candidates], reverse=True)
+        ranking = normalized["ranking"]
+        evaluations = normalized["evaluations"]
+        for index, item in enumerate(ranking):
+            hypothesis = by_id.get(item["id"])
+            if hypothesis is None:
+                continue
+            if index < len(original_elo_values):
+                hypothesis.elo_score = original_elo_values[index]
+            evaluation = {
+                "rank": index + 1,
+                "overall_score": item.get("overall_score", 0.0),
+                "keep": item.get("keep", True),
+                **evaluations.get(hypothesis.hypothesis_id, {}),
+            }
+            if item.get("summary") and not evaluation.get("summary"):
+                evaluation["summary"] = item["summary"]
+            hypothesis.codex_rerank_reviews.append(evaluation)
+            hypothesis.review_comments = dedupe_preserve_order(
+                hypothesis.review_comments
+                + coerce_string_list(evaluation.get("weaknesses", []))
+                + coerce_string_list(evaluation.get("novelty_risks", []))
+                + coerce_string_list(evaluation.get("feasibility_risks", []))
+            )
+            if evaluation.get("summary"):
+                hypothesis.review_comments = dedupe_preserve_order(
+                    hypothesis.review_comments + [f"codex_reranking: {evaluation['summary']}"]
+                )
+
+
 class EvolutionAgent(LiteratureMixin):
     def __init__(self) -> None:
         super().__init__()
@@ -2585,7 +2713,7 @@ class EvolutionAgent(LiteratureMixin):
         try:
             payload = call_json(
                 build_evolution_messages(
-                    research_goal=research_goal.description,
+                    research_goal=research_goal.prompt_context(),
                     research_plan=research_plan.to_dict(),
                     top_hypotheses=[hypothesis.compact_summary() for hypothesis in source_hypotheses],
                     literature_notes=literature_notes,
@@ -2694,7 +2822,7 @@ class EvolutionAgent(LiteratureMixin):
             try:
                 refill_payload = call_json(
                     build_evolution_refill_messages(
-                        research_goal=research_goal.description,
+                        research_goal=research_goal.prompt_context(),
                         research_plan=research_plan.to_dict(),
                         top_hypotheses=[hypothesis.compact_summary() for hypothesis in source_hypotheses],
                         accepted_hypotheses=[hypothesis.compact_summary() for hypothesis in evolved_hypotheses],
@@ -2878,11 +3006,11 @@ class MetaReviewAgent(LiteratureMixin):
         try:
             payload = _coerce_mapping(call_json(
                 build_meta_review_messages(
-                    research_goal=research_goal.description,
+                    research_goal=research_goal.prompt_context(),
                     research_plan=research_plan.to_dict(),
                     ranked_hypotheses=[hypothesis.compact_summary() for hypothesis in ranked],
                     recent_reviews=recent_reviews,
-                    tournament_history=context.tournament_results,
+                    tournament_history=context.tournament_results + context.codex_rerank_history,
                     proximity_summary={
                         "clusters": proximity_data.get("clusters", []),
                         "duplicate_candidates": proximity_data.get("duplicate_candidates", []),

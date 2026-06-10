@@ -141,6 +141,8 @@ def _average_score(scores: Dict[str, float]) -> float:
 class ResearchGoal:
     description: str
     constraints: Dict[str, Any] = field(default_factory=dict)
+    reference_arxiv_url: Optional[str] = None
+    reference_paper_context: Dict[str, Any] = field(default_factory=dict)
     llm_model: Optional[str] = None
     critic_llm_model: Optional[str] = None
     num_hypotheses: Optional[int] = None
@@ -159,12 +161,14 @@ class ResearchGoal:
     prior_art_repair_attempts: Optional[int] = None
     ranking_matches_per_cycle: Optional[int] = None
     proximity_similarity_threshold: Optional[float] = None
-    deep_review_top_k: Optional[int] = None
     hypothesis_decay_fraction: Optional[float] = None
     enable_safety_review: Optional[bool] = None
     max_concurrency: Optional[int] = None
 
     def __post_init__(self) -> None:
+        self.reference_arxiv_url = str(self.reference_arxiv_url or "").strip() or None
+        if not isinstance(self.reference_paper_context, dict):
+            self.reference_paper_context = {}
         step_temperatures = config.get("step_temperatures", {})
         self.llm_model = self.llm_model or _configured_llm_model("thinking", "mimo-v2.5-pro")
         self.critic_llm_model = self.critic_llm_model or _configured_llm_model("critic", self.llm_model)
@@ -268,15 +272,11 @@ class ResearchGoal:
             minimum=0.0,
             maximum=1.0,
         )
-        self.deep_review_top_k = _bounded_int(
-            self.deep_review_top_k if self.deep_review_top_k is not None else config.get("deep_review_top_k", 3),
-            default=3,
-        )
         self.hypothesis_decay_fraction = _bounded_float(
             self.hypothesis_decay_fraction
             if self.hypothesis_decay_fraction is not None
-            else config.get("hypothesis_decay_fraction", 0.10),
-            default=0.10,
+            else config.get("hypothesis_decay_fraction", 0.0),
+            default=0.0,
             minimum=0.0,
             maximum=1.0,
         )
@@ -293,6 +293,7 @@ class ResearchGoal:
         return "|".join(
             [
                 self.description.strip(),
+                str(self.reference_arxiv_url or ""),
                 str(sorted(self.constraints.items())),
                 str(self.llm_model),
                 str(self.critic_llm_model),
@@ -312,12 +313,39 @@ class ResearchGoal:
                 str(self.prior_art_repair_attempts),
                 str(self.ranking_matches_per_cycle),
                 str(self.proximity_similarity_threshold),
-                str(self.deep_review_top_k),
                 str(self.hypothesis_decay_fraction),
                 str(self.enable_safety_review),
                 str(self.max_concurrency),
             ]
         )
+
+    def prompt_context(self) -> str:
+        parts = [self.description.strip()]
+        if self.reference_paper_context:
+            compact_reference = {
+                "arxiv_id": self.reference_paper_context.get("arxiv_id"),
+                "arxiv_url": self.reference_paper_context.get("arxiv_url") or self.reference_arxiv_url,
+                "title": self.reference_paper_context.get("title"),
+                "concise_summary": self.reference_paper_context.get("concise_summary"),
+                "core_problem": self.reference_paper_context.get("core_problem"),
+                "core_mechanism": self.reference_paper_context.get("core_mechanism"),
+                "key_results": self.reference_paper_context.get("key_results", [])[:5],
+                "limitations": self.reference_paper_context.get("limitations", [])[:5],
+                "reusable_insights_for_new_ideas": self.reference_paper_context.get(
+                    "reusable_insights_for_new_ideas",
+                    [],
+                )[:8],
+                "avoid_copying": self.reference_paper_context.get("avoid_copying", [])[:6],
+            }
+            parts.append("Required reference paper context:\n" + json.dumps(compact_reference, ensure_ascii=False, indent=2))
+        elif self.reference_arxiv_url:
+            parts.append(f"Required reference paper: {self.reference_arxiv_url}")
+        return "\n\n".join(part for part in parts if part)
+
+    def reference_seed_queries(self) -> List[str]:
+        if not isinstance(self.reference_paper_context, dict):
+            return []
+        return _dedupe(self.reference_paper_context.get("seed_queries", []))
 
 
 @dataclass
@@ -380,10 +408,17 @@ class ResearchPlan:
 
         seed_queries = [research_goal.description.strip()]
         seed_queries.extend(direction_families[:6])
+        seed_queries.extend(research_goal.reference_seed_queries())
 
         notes = ["Fallback research plan generated locally because no structured plan was available."]
         if direction_families:
             notes.append("Constraint-aware fallback preserved the requested direction families for diversity tracking.")
+        if research_goal.reference_arxiv_url:
+            notes.append(f"Required reference paper: {research_goal.reference_arxiv_url}.")
+        if research_goal.reference_paper_context:
+            reference_title = str(research_goal.reference_paper_context.get("title") or "").strip()
+            if reference_title:
+                notes.append(f"Use the reference paper as inspiration, not as a template to copy: {reference_title}.")
 
         return cls(
             objective=research_goal.description.strip(),
@@ -489,7 +524,8 @@ class Hypothesis:
     prior_art_similar_papers: List[Dict[str, Any]] = field(default_factory=list)
     prior_art_repair_count: int = 0
     debate_history: List[Dict[str, Any]] = field(default_factory=list)
-    specialized_reviews: List[Dict[str, Any]] = field(default_factory=list)
+    review_artifacts: List[Dict[str, Any]] = field(default_factory=list)
+    codex_rerank_reviews: List[Dict[str, Any]] = field(default_factory=list)
     is_active: bool = True
     created_in_iteration: int = 0
 
@@ -562,7 +598,8 @@ class Hypothesis:
             prior_art_similar_papers=_dict_list(data.get("prior_art_similar_papers")),
             prior_art_repair_count=prior_art_repair_count,
             debate_history=_dict_list(data.get("debate_history")),
-            specialized_reviews=_dict_list(data.get("specialized_reviews")),
+            review_artifacts=_dict_list(data.get("review_artifacts")),
+            codex_rerank_reviews=_dict_list(data.get("codex_rerank_reviews")),
             is_active=bool(data.get("is_active", True)),
             created_in_iteration=max(0, created_in_iteration),
         )
@@ -598,6 +635,8 @@ class Hypothesis:
             self.review_summary = summary
 
         verdict = str(review.get("verdict") or "").strip().lower()
+        if bool(review.get("reject")) and not verdict:
+            verdict = "reject"
         if verdict:
             self.review_verdict = verdict
             if verdict.startswith("reject"):
@@ -606,6 +645,10 @@ class Hypothesis:
         comments = coerce_string_list(review.get("strengths", []))
         comments.extend(coerce_string_list(review.get("weaknesses", [])))
         comments.extend(coerce_string_list(review.get("improvement_actions", [])))
+        for free_text_key in ("reflection", "feasibility_rationale", "reference_connection"):
+            free_text = str(review.get(free_text_key) or "").strip()
+            if free_text:
+                comments.append(f"{stage_label}: {free_text}")
         story_diagnosis = review.get("story_diagnosis") if isinstance(review.get("story_diagnosis"), dict) else {}
         combination_risk = str(story_diagnosis.get("combination_risk") or "").strip().lower()
         if combination_risk in {"medium", "high"}:
@@ -654,6 +697,8 @@ class Hypothesis:
             "evolution_delta": self.evolution_delta,
             "parent_ids": self.parent_ids,
             "verdict": self.review_verdict,
+            "latest_review": self.review_artifacts[-1] if self.review_artifacts else {},
+            "latest_codex_rerank": self.codex_rerank_reviews[-1] if self.codex_rerank_reviews else {},
         }
 
     def comparison_signature(self) -> str:
@@ -684,6 +729,8 @@ class Hypothesis:
             "review_summary": self.review_summary,
             "scores": self.scores,
             "references": self.references,
+            "review_artifacts": self.review_artifacts[-3:],
+            "codex_rerank_reviews": self.codex_rerank_reviews[-3:],
             "is_active": self.is_active,
         }
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -756,7 +803,8 @@ class Hypothesis:
             "prior_art_similar_papers": self.prior_art_similar_papers,
             "prior_art_repair_count": self.prior_art_repair_count,
             "debate_history": self.debate_history,
-            "specialized_reviews": self.specialized_reviews,
+            "review_artifacts": self.review_artifacts,
+            "codex_rerank_reviews": self.codex_rerank_reviews,
             "is_active": self.is_active,
             "created_in_iteration": self.created_in_iteration,
         }
@@ -784,9 +832,11 @@ class StepResult:
 class ContextMemory:
     hypotheses: Dict[str, Hypothesis] = field(default_factory=dict)
     tournament_results: List[Dict[str, Any]] = field(default_factory=list)
+    codex_rerank_history: List[Dict[str, Any]] = field(default_factory=list)
     meta_review_feedback: List[Dict[str, Any]] = field(default_factory=list)
     research_overviews: List[Dict[str, Any]] = field(default_factory=list)
     cycle_history: List[Dict[str, Any]] = field(default_factory=list)
+    reference_paper_context: Dict[str, Any] = field(default_factory=dict)
     research_plan: Optional[ResearchPlan] = None
     iteration_number: int = 0
     goal_signature: Optional[str] = None
@@ -813,9 +863,13 @@ class ContextMemory:
                     context.add_hypothesis(Hypothesis.from_dict(value))
 
         context.tournament_results = _dict_list(data.get("tournament_results"))
+        context.codex_rerank_history = _dict_list(data.get("codex_rerank_history"))
         context.meta_review_feedback = _dict_list(data.get("meta_review_feedback"))
         context.research_overviews = _dict_list(data.get("research_overviews"))
         context.cycle_history = _dict_list(data.get("cycle_history"))
+        context.reference_paper_context = _mapping(data.get("reference_paper_context")) or dict(
+            research_goal.reference_paper_context
+        )
 
         research_plan = data.get("research_plan")
         context.research_plan = ResearchPlan.from_dict(research_plan, research_goal) if isinstance(research_plan, dict) else None
@@ -841,9 +895,11 @@ class ContextMemory:
     def reset_for_goal(self, research_goal: ResearchGoal) -> None:
         self.hypotheses.clear()
         self.tournament_results.clear()
+        self.codex_rerank_history.clear()
         self.meta_review_feedback.clear()
         self.research_overviews.clear()
         self.cycle_history.clear()
+        self.reference_paper_context = dict(research_goal.reference_paper_context)
         self.research_plan = None
         self.iteration_number = 0
         self.goal_signature = research_goal.signature()
@@ -912,9 +968,11 @@ class ContextMemory:
         return {
             "hypotheses": {key: hypothesis.to_dict() for key, hypothesis in self.hypotheses.items()},
             "tournament_results": self.tournament_results,
+            "codex_rerank_history": self.codex_rerank_history,
             "meta_review_feedback": self.meta_review_feedback,
             "research_overviews": self.research_overviews,
             "cycle_history": self.cycle_history,
+            "reference_paper_context": self.reference_paper_context,
             "research_plan": self.research_plan.to_dict() if self.research_plan else None,
             "iteration_number": self.iteration_number,
             "goal_signature": self.goal_signature,
@@ -926,6 +984,8 @@ class ContextMemory:
 class ResearchGoalRequest(BaseModel):
     description: str
     constraints: Dict[str, Any] = Field(default_factory=dict)
+    reference_arxiv_url: str
+    reference_paper_context: Dict[str, Any] = Field(default_factory=dict)
     llm_model: Optional[str] = None
     critic_llm_model: Optional[str] = None
     num_hypotheses: Optional[int] = None
@@ -944,7 +1004,6 @@ class ResearchGoalRequest(BaseModel):
     prior_art_repair_attempts: Optional[int] = None
     ranking_matches_per_cycle: Optional[int] = None
     proximity_similarity_threshold: Optional[float] = None
-    deep_review_top_k: Optional[int] = None
     hypothesis_decay_fraction: Optional[float] = None
     enable_safety_review: Optional[bool] = None
     max_concurrency: Optional[int] = None

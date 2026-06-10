@@ -2,19 +2,20 @@
 
 ![Hypothesis Forge workflow](docs/assets/hypothesis-forge-overview.svg)
 
-Hypothesis Forge is a CLI-first research ideation engine inspired by the AI co-scientist workflow in [arXiv:2502.18864](https://arxiv.org/pdf/2502.18864). It turns a research goal into a structured plan, generates and evolves hypotheses over multiple cycles, grounds ideas with literature search, audits prior art, ranks candidates, and writes reviewable Markdown/JSON reports.
+Hypothesis Forge is a CLI-first research ideation engine inspired by the AI co-scientist workflow in [arXiv:2502.18864](https://arxiv.org/pdf/2502.18864). It turns a research goal plus a required reference arXiv paper into a structured plan, generates and evolves hypotheses over multiple cycles, grounds ideas with literature search, audits prior art, ranks candidates, and writes reviewable Markdown/JSON reports.
 
 The project is intentionally lightweight: it is built for local experimentation, reproducible idea sweeps, and quick inspection of how a pool of research hypotheses changes over time.
 
-For agents: copy `config.example.yaml` to `config.yaml`, set `thinking_llm` and `critic_llm`, then run `python app.py --goal "YOUR_RESEARCH_GOAL" --output-dir results/YOUR_RUN`.
+For agents: copy `config.example.yaml` to `config.yaml`, set `thinking_llm` and `critic_llm`, then run `python app.py --goal "YOUR_RESEARCH_GOAL" --reference-arxiv "https://arxiv.org/abs/2502.18864" --output-dir results/YOUR_RUN`.
 
 ## What It Does
 
-- Builds a structured research plan from a plain-language goal.
+- Builds a structured research plan from a plain-language goal and one required arXiv reference paper.
 - Generates fresh hypotheses and evolves high-scoring candidates across cycles.
+- Converts and summarizes the reference paper with the local `arxiv2md-summarize` skill script before ideation.
 - Retrieves literature from Semantic Scholar and arXiv for grounding.
 - Runs larger-pool prior-art checks to catch duplicate or weakly differentiated ideas.
-- Reviews hypotheses with separate critic/ranking agents.
+- Reviews hypotheses with one consolidated critic pass and reranks the current top four ideas with `codex exec --yolo -m gpt-5.4`.
 - Tracks trajectory quality, diversity, stability, and failure modes.
 - Saves timestamped reports plus live checkpoints for long runs.
 
@@ -101,18 +102,25 @@ Semantic similarity is enabled by default:
 
 ```yaml
 sentence_transformer_enabled: true
-sentence_transformer_local_files_only: true
+sentence_transformer_model: "BAAI/bge-small-en-v1.5"
+sentence_transformer_local_files_only: false
+prior_art_include_cache_corpus: true
+prior_art_embedding_candidates: 200
+prior_art_vector_index_path: ".cache/prior_art_vector_index.npz"
+prior_art_vector_index_backend: "auto"
+prior_art_query_prefix: ""
 ```
 
-Keep `sentence_transformer_local_files_only: true` when the embedding model is already cached locally. Set it to `false` for a first run that should download `all-MiniLM-L6-v2`.
+Prior-art recall uses a persistent embedding index over the retrieved corpus plus the local literature cache, so large local libraries do not need to be re-embedded on every audit. Query and paper embeddings use a compact `Title:` + `Abstract:` text format. The `auto` backend uses FAISS when it is installed and falls back to exact numpy search otherwise. Keep `sentence_transformer_local_files_only: true` only after the configured embedding model is already cached locally.
 
 ## Quick Start
 
-With the default run settings in `config.yaml`, a normal run only needs a goal and output directory:
+With the default run settings in `config.yaml`, a normal run needs a goal, reference arXiv paper, and output directory:
 
 ```bash
 python app.py \
   --goal "Generate strong research ideas for compressed trajectory representations in multimodal embodied agents, focusing on separating noise from meaningful structure in action/state trajectories and using compression to improve planning, generalization, and policy quality." \
+  --reference-arxiv "https://arxiv.org/abs/2502.18864" \
   --output-dir results/trajectory_compression_c6650
 ```
 
@@ -123,9 +131,10 @@ cycles: 5
 num_hypotheses: 5
 top_k_hypotheses: 3
 ranking_matches_per_cycle: 1000
-deep_review_top_k: 3
 max_literature_results: 6
 max_concurrency: 16
+enable_codex_reranking: true
+codex_rerank_model: "gpt-5.4"
 ```
 
 You can override any of these from the CLI when needed:
@@ -133,17 +142,17 @@ You can override any of these from the CLI when needed:
 ```bash
 python app.py \
   --goal "Study robust evaluation methods for AI scientific hypothesis generation" \
+  --reference-arxiv "https://arxiv.org/abs/2502.18864" \
   --cycles 1 \
   --num-hypotheses 2 \
   --ranking-matches-per-cycle 3 \
-  --deep-review-top-k 1 \
   --output-dir results/smoke_test
 ```
 
 The Makefile wrapper is useful for short goals:
 
 ```bash
-make run GOAL="Study robust evaluation methods for AI scientific hypothesis generation" OUTPUT_DIR=results/smoke_test
+make run GOAL="Study robust evaluation methods for AI scientific hypothesis generation" REFERENCE_ARXIV="https://arxiv.org/abs/2502.18864" OUTPUT_DIR=results/smoke_test
 ```
 
 Runs resume automatically by default. If the same `--goal` and workflow settings are used with the same `--output-dir`, the CLI loads the newest matching `checkpoint_latest.json` or timestamped report and continues until the requested `--cycles` total is reached. Use `--no-resume` when you intentionally want to ignore existing artifacts in that directory.
@@ -205,9 +214,11 @@ python -m unittest discover -s tests
 
 ## Operational Notes
 
+- The required reference paper is converted through the local `arxiv2md-summarize` skill script, then summarized by the thinking LLM before the workflow starts.
+- Top-four reranking calls the Codex CLI as `codex exec --yolo -m gpt-5.4`; set `enable_codex_reranking: false` only for smoke tests without Codex CLI.
 - arXiv `429` responses trigger a cooldown saved at `arxiv_state_path`.
 - Semantic Scholar is optional. Without an API key, the workflow uses unauthenticated rate limits or continues with the remaining sources.
-- `sentence_transformer_local_files_only: true` requires the configured embedding model to already exist locally; otherwise similarity falls back to lexical matching.
+- `sentence_transformer_local_files_only: true` requires the configured embedding model to already exist locally; otherwise vector recall falls back to direct lexical/embedding safeguards.
 - Set `max_literature_results: 0` for LLM-only smoke tests without live literature grounding.
 
 ## Scope

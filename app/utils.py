@@ -148,37 +148,42 @@ def generate_visjs_data(adjacency_graph: Dict[str, List[Dict[str, float]]], thre
     return {"nodes": nodes, "edges": edges}
 
 
-_sentence_transformer_model = None
+_sentence_transformer_models: Dict[tuple[str, bool], Any] = {}
 _similarity_warning_emitted = False
 
 
-def get_sentence_transformer_model():
-    global _sentence_transformer_model
-    if _sentence_transformer_model is False:
-        raise RuntimeError("Sentence transformer model is unavailable.")
-    if _sentence_transformer_model is None:
+def get_sentence_transformer_model(model_name: str | None = None, local_files_only: bool | None = None):
+    if not bool(config.get("sentence_transformer_enabled", True)):
+        raise RuntimeError("Sentence transformer similarity is disabled by configuration.")
+
+    resolved_model_name = str(model_name or config.get("sentence_transformer_model", "BAAI/bge-small-en-v1.5"))
+    resolved_local_files_only = (
+        bool(local_files_only)
+        if local_files_only is not None
+        else bool(config.get("sentence_transformer_local_files_only", True))
+    )
+    cache_key = (resolved_model_name, resolved_local_files_only)
+    cached_model = _sentence_transformer_models.get(cache_key)
+    if cached_model is False:
+        raise RuntimeError(f"Sentence transformer model is unavailable: {resolved_model_name}")
+    if cached_model is None:
         from sentence_transformers import SentenceTransformer
 
-        if not bool(config.get("sentence_transformer_enabled", True)):
-            _sentence_transformer_model = False
-            raise RuntimeError("Sentence transformer similarity is disabled by configuration.")
-
-        model_name = config.get("sentence_transformer_model", "all-MiniLM-L6-v2")
-        local_files_only = bool(config.get("sentence_transformer_local_files_only", True))
         logger.info(
             "Loading sentence transformer model: %s (local_files_only=%s)",
-            model_name,
-            local_files_only,
+            resolved_model_name,
+            resolved_local_files_only,
         )
         try:
-            _sentence_transformer_model = SentenceTransformer(
-                model_name,
-                local_files_only=local_files_only,
+            cached_model = SentenceTransformer(
+                resolved_model_name,
+                local_files_only=resolved_local_files_only,
             )
         except Exception as exc:  # noqa: BLE001
-            _sentence_transformer_model = False
+            _sentence_transformer_models[cache_key] = False
             raise RuntimeError(f"Sentence transformer load failed: {exc}") from exc
-    return _sentence_transformer_model
+        _sentence_transformer_models[cache_key] = cached_model
+    return cached_model
 
 
 def lexical_similarity_score(text_a: str, text_b: str) -> float:
