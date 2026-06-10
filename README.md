@@ -12,7 +12,7 @@ For agents: copy `config.example.yaml` to `config.yaml`, set `thinking_llm` and 
 
 - Builds a structured research plan from a plain-language goal and one required arXiv reference paper.
 - Generates fresh hypotheses and evolves high-scoring candidates across cycles.
-- Converts and summarizes the reference paper with the local `arxiv2md-summarize` skill script before ideation.
+- Converts and summarizes the reference paper with the installed `arxiv2md` package before ideation.
 - Retrieves literature from Semantic Scholar and arXiv for grounding.
 - Runs larger-pool prior-art checks to catch duplicate or weakly differentiated ideas.
 - Reviews hypotheses with one consolidated critic pass and reranks the current top four ideas with `codex exec --yolo -m gpt-5.4`.
@@ -214,9 +214,12 @@ python -m unittest discover -s tests
 
 ## Operational Notes
 
-- The required reference paper is converted through the local `arxiv2md-summarize` skill script, then summarized by the thinking LLM before the workflow starts.
+- The required reference paper is converted through the installed `arxiv2md` package, then summarized by the thinking LLM before the workflow starts.
 - Top-four reranking calls the Codex CLI as `codex exec --yolo -m gpt-5.4`; set `enable_codex_reranking: false` only for smoke tests without Codex CLI.
 - arXiv `429` responses trigger a cooldown saved at `arxiv_state_path`.
+- Reference paper conversion uses the `arxiv2md` package installed in the same
+  Python environment that runs Hypothesis Forge. If conversion fails with an
+  import error, install or expose that package in the active environment.
 - Semantic Scholar is optional. Without an API key, the workflow uses unauthenticated rate limits or continues with the remaining sources.
 - `sentence_transformer_local_files_only: true` requires the configured embedding model to already exist locally; otherwise vector recall falls back to direct lexical/embedding safeguards.
 - Set `max_literature_results: 0` for LLM-only smoke tests without live literature grounding.

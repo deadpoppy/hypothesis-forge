@@ -32,10 +32,11 @@ from app.agents import (
 )
 from app.literature import LiteratureCache, LiteratureSearchService, dedupe_notes
 import app.llm as llm_module
+import app.reference as reference_module
 from app.llm import call_llm
 from app.models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan
 from app.prompts import _serialize_literature, build_evolution_messages, build_generation_messages, build_meta_review_messages
-from app.reference import normalize_arxiv_reference
+from app.reference import ReferencePaperError, normalize_arxiv_reference
 from app.reports import build_markdown_report
 from app.tools.arxiv_search import ArxivSearchTool
 from app.tools.semantic_scholar import SemanticScholarSearchTool
@@ -358,6 +359,45 @@ critic_llm:
 
         self.assertEqual(arxiv_id, "2502.18864v1")
         self.assertEqual(url, "https://arxiv.org/abs/2502.18864v1")
+
+    def test_reference_markdown_conversion_uses_installed_arxiv2md_package(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            Path(command[-1]).write_text("# Converted\n\nBody from installed package", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with patch.object(reference_module.subprocess, "run", side_effect=fake_run):
+            markdown = reference_module._convert_arxiv_to_markdown(
+                "https://arxiv.org/abs/2502.18864",
+                "2502.18864",
+            )
+
+        self.assertIn("# Converted", markdown)
+        self.assertIn("Body from installed package", markdown)
+        self.assertEqual(calls[0][0], sys.executable)
+        self.assertEqual(calls[0][1], "-c")
+        self.assertIn("from arxiv2md import ingest_paper_sync", calls[0][2])
+
+    def test_reference_markdown_import_error_mentions_installed_arxiv2md(self):
+        command = [sys.executable, "-c", "", "https://arxiv.org/abs/2502.18864", "/tmp/missing.md"]
+        completed = subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr="arxiv2md is not importable in this Python environment.",
+        )
+
+        with patch.object(reference_module.subprocess, "run", return_value=completed):
+            with self.assertRaises(ReferencePaperError) as ctx:
+                reference_module._convert_arxiv_to_markdown(
+                    "https://arxiv.org/abs/2502.18864",
+                    "2502.18864",
+                )
+
+        self.assertIn("installed arxiv2md", str(ctx.exception))
+        self.assertIn("not importable", str(ctx.exception))
 
     def test_generation_temperature_cap_stays_below_overheated_range(self):
         goal = ResearchGoal("goal", generation_temperature=0.88)

@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 from typing import Any, Dict
 
@@ -12,10 +13,6 @@ from .config import config
 from .llm import LLMCallError, call_json
 from .prompts import build_reference_summary_messages
 from .utils import coerce_string_list, logger
-
-
-SKILL_DIR = Path("/Users/milo/.codex/skills/arxiv2md-summarize")
-SUMMARIZE_SCRIPT = SKILL_DIR / "scripts" / "summarize_paper.py"
 
 
 class ReferencePaperError(RuntimeError):
@@ -53,43 +50,66 @@ def prepare_reference_paper(reference: str, model: str, temperature: float = 0.1
 
 
 def _convert_arxiv_to_markdown(reference: str, arxiv_id: str) -> str:
-    if not SUMMARIZE_SCRIPT.exists():
-        raise ReferencePaperError(f"arxiv2md skill script not found: {SUMMARIZE_SCRIPT}")
-
     timeout = int(config.get("reference_arxiv_timeout_seconds", 180) or 180)
-    with tempfile.TemporaryDirectory(prefix="co_scientist_reference_") as temp_dir:
+    return _convert_with_installed_arxiv2md(reference, arxiv_id, timeout)
+
+
+def _convert_with_installed_arxiv2md(reference: str, arxiv_id: str, timeout: int) -> str:
+    with tempfile.TemporaryDirectory(prefix="co_scientist_reference_pkg_") as temp_dir:
+        output_path = Path(temp_dir) / f"{arxiv_id.replace('/', '_')}.md"
         command = [
             sys.executable,
-            str(SUMMARIZE_SCRIPT),
+            "-c",
+            textwrap.dedent(
+                """
+                import sys
+                from pathlib import Path
+
+                try:
+                    from arxiv2md import ingest_paper_sync
+                except ImportError as exc:
+                    raise SystemExit(
+                        "arxiv2md is not importable in this Python environment. "
+                        "Install the package into the environment running Hypothesis Forge "
+                        "(for example: pip install -e /path/to/paper-daily). "
+                        f"Original error: {exc}"
+                    )
+
+                result = ingest_paper_sync(
+                    sys.argv[1],
+                    remove_refs=True,
+                    remove_toc=True,
+                    remove_inline_citations=True,
+                )
+                Path(sys.argv[2]).write_text(result.content, encoding="utf-8")
+                """
+            ).strip(),
             str(reference).strip(),
-            "--output",
-            temp_dir,
+            str(output_path),
         ]
         try:
             completed = subprocess.run(
                 command,
-                cwd=str(SKILL_DIR),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise ReferencePaperError(f"Timed out converting reference paper {arxiv_id}.") from exc
+            raise ReferencePaperError(f"Timed out converting reference paper {arxiv_id} with installed arxiv2md.") from exc
         except OSError as exc:
-            raise ReferencePaperError(f"Could not run arxiv2md skill script: {exc}") from exc
+            raise ReferencePaperError(f"Could not run installed arxiv2md converter: {exc}") from exc
 
         if completed.returncode != 0:
             stderr = (completed.stderr or completed.stdout or "").strip()
             raise ReferencePaperError(
-                f"Failed to convert reference paper {arxiv_id} with arxiv2md skill script: {stderr[:1200]}"
+                f"Failed to convert reference paper {arxiv_id} with installed arxiv2md: {stderr[:1200]}"
             )
 
-        markdown_paths = sorted(Path(temp_dir).glob("*.md"))
-        if not markdown_paths:
-            raise ReferencePaperError(f"arxiv2md skill script did not produce Markdown for {arxiv_id}.")
+        if not output_path.exists():
+            raise ReferencePaperError(f"Installed arxiv2md did not produce Markdown for {arxiv_id}.")
 
-        markdown = markdown_paths[0].read_text(encoding="utf-8")
+        markdown = output_path.read_text(encoding="utf-8")
         if not markdown.strip():
             raise ReferencePaperError(f"Reference paper Markdown for {arxiv_id} is empty.")
         return markdown
