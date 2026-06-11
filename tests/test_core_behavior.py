@@ -1405,20 +1405,28 @@ critic_llm:
                 {
                     "idea_id": "H1",
                     "idea_title": "Cache Router",
-                    "search_terms": ["end-to-end model", "autonomous driving model", "behavior cloning"],
-                    "broader_terms": ["self-driving system"],
-                    "rationale": "routing and driving vocabulary",
+                    "search_terms": [
+                        "route requests by cache pressure",
+                        "transformer serving",
+                        "KV cache",
+                    ],
+                    "broader_terms": ["LLM inference"],
+                    "rationale": "broad serving vocabulary",
                 },
                 {
                     "idea_id": "H2",
                     "idea_title": "Spec Verifier",
-                    "search_terms": ["verification overhead", "fused kernel", "draft validation"],
-                    "broader_terms": ["speculative decoding"],
-                    "rationale": "verification vocabulary",
+                    "search_terms": [
+                        "verify drafts with fused kernels",
+                        "speculative decoding",
+                        "kernel fusion",
+                    ],
+                    "broader_terms": ["LLM acceleration"],
+                    "rationale": "broad decoding vocabulary",
                 },
             ],
-            "shared_terms": ["autonomous driving", "end-to-end driving"],
-            "shared_broader_terms": ["self-driving systems"],
+            "shared_terms": ["large language model inference", "transformer inference"],
+            "shared_broader_terms": ["efficient inference"],
             "notes": ["batch terms"],
         }
         audit_payload = {
@@ -1471,10 +1479,14 @@ critic_llm:
         self.assertEqual(len(captured_queries["queries"]), 1)
         combined_query = captured_queries["queries"][0]
         self.assertIn(" OR ", combined_query)
-        self.assertIn("end-to-end model", combined_query)
-        self.assertIn("autonomous driving model", combined_query)
-        self.assertIn("verification overhead", combined_query)
-        self.assertIn("fused kernel", combined_query)
+        self.assertIn("transformer serving", combined_query)
+        self.assertIn("KV cache", combined_query)
+        self.assertIn("LLM inference", combined_query)
+        self.assertIn("speculative decoding", combined_query)
+        self.assertIn("kernel fusion", combined_query)
+        self.assertIn("large language model inference", combined_query)
+        self.assertNotIn("route requests by cache pressure", combined_query)
+        self.assertNotIn("verify drafts with fused kernels", combined_query)
         self.assertEqual(result.data["checked_count"], 2)
         self.assertEqual(result.data["query_count"], 1)
         self.assertEqual(result.data["batch_prefetch"]["query_count"], 1)

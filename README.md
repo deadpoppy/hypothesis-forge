@@ -117,7 +117,7 @@ prior_art_vector_index_backend: "auto"
 prior_art_query_prefix: ""
 ```
 
-Prior-art recall now plans differential search terms for the whole cycle's idea set, deduplicates all terms into one complete OR query, sends that query once to each paper source with a default limit of 1000 papers per source, writes every returned paper into the cache, and then reuses the local literature cache as the embedding corpus for per-idea checks. Other online literature grounding also bundles plain candidate terms before calling the paper sources. Query and paper embeddings use a compact `Title:` + `Abstract:` text format. The `auto` backend uses FAISS when it is installed and falls back to chunked numpy search otherwise. Keep `sentence_transformer_local_files_only: true` only after the configured embedding model is already cached locally.
+Prior-art recall now plans broad field/category search terms for the whole cycle's idea set, deduplicates all terms into one complete OR query, sends that query once to each paper source with a default limit of 1000 papers per source, writes every returned paper into the cache, and then reuses the local literature cache as the embedding corpus for per-idea checks. Other online literature grounding also bundles plain candidate terms before calling the paper sources. Query and paper embeddings use a compact `Title:` + `Abstract:` text format. The `auto` backend uses FAISS when it is installed and falls back to chunked numpy search otherwise. Keep `sentence_transformer_local_files_only: true` only after the configured embedding model is already cached locally.
 
 ## Quick Start
 

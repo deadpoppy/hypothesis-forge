@@ -778,6 +778,72 @@ class LiteratureMixin:
                 cleaned.append(normalized)
         return dedupe_preserve_order(cleaned)
 
+    def _is_broad_literature_term(self, term: str) -> bool:
+        value = " ".join(str(term or "").split()).strip()
+        if not value or len(value) > 80:
+            return False
+        if re.search(r"[.!?;:]", value):
+            return False
+
+        words = re.findall(r"[A-Za-z0-9+#]+(?:[-/][A-Za-z0-9+#]+)?", value)
+        if not words or len(words) > 6:
+            return False
+
+        lower = value.casefold()
+        sentence_markers = {
+            "this",
+            "that",
+            "these",
+            "those",
+            "should",
+            "would",
+            "could",
+            "because",
+            "when",
+            "while",
+            "where",
+            "whether",
+        }
+        if any(marker in lower.split() for marker in sentence_markers):
+            return False
+
+        leading_verbs = {
+            "use",
+            "uses",
+            "using",
+            "route",
+            "routes",
+            "routing",
+            "verify",
+            "verifies",
+            "reduce",
+            "reduces",
+            "improve",
+            "improves",
+            "avoid",
+            "avoids",
+            "adapt",
+            "adapts",
+            "choose",
+            "chooses",
+            "combine",
+            "combines",
+            "predict",
+            "predicts",
+        }
+        first_word = words[0].casefold()
+        if first_word in leading_verbs and len(words) > 2:
+            return False
+
+        return True
+
+    def _normalize_broad_literature_terms(self, terms: Sequence[Any]) -> List[str]:
+        return [
+            term
+            for term in self._normalize_search_terms(terms)
+            if self._is_broad_literature_term(term)
+        ]
+
     def _quote_search_term(self, term: str) -> str:
         value = " ".join(str(term).replace('"', "").split())
         if not value:
@@ -859,7 +925,7 @@ class LiteratureMixin:
     ) -> Dict[str, Any]:
         idea_payload = []
         for hypothesis in hypotheses:
-            fallback_terms = self._normalize_search_terms(
+            fallback_terms = self._normalize_broad_literature_terms(
                 list(hypothesis.search_queries)
                 + [hypothesis.title, hypothesis.focus_area, hypothesis.primary_bottleneck]
                 + _focus_area_query_variants(hypothesis.focus_area)
@@ -874,10 +940,9 @@ class LiteratureMixin:
                 }
             )
 
-        shared_terms = self._normalize_search_terms(
+        shared_terms = self._normalize_broad_literature_terms(
             list(research_plan.seed_queries)
             + research_goal.reference_seed_queries()
-            + [research_goal.description]
         )
         return {
             "ideas": idea_payload,
@@ -944,9 +1009,9 @@ class LiteratureMixin:
                     continue
                 idea_id = str(item.get("idea_id") or "").strip()
                 idea_title = str(item.get("idea_title") or "").strip()
-                search_terms = self._normalize_search_terms(item.get("search_terms") or item.get("terms") or [])
-                broader_terms = self._normalize_search_terms(item.get("broader_terms") or item.get("keywords") or [])
-                if not idea_id:
+                search_terms = self._normalize_broad_literature_terms(item.get("search_terms") or item.get("terms") or [])
+                broader_terms = self._normalize_broad_literature_terms(item.get("broader_terms") or item.get("keywords") or [])
+                if not idea_id or not (search_terms or broader_terms):
                     continue
                 ideas_payload.append(
                     {
@@ -972,17 +1037,17 @@ class LiteratureMixin:
                 {
                     "idea_id": hypothesis.hypothesis_id,
                     "idea_title": hypothesis.title,
-                    "search_terms": self._normalize_search_terms(fallback_item.get("search_terms") or []),
-                    "broader_terms": self._normalize_search_terms(fallback_item.get("broader_terms") or []),
+                    "search_terms": self._normalize_broad_literature_terms(fallback_item.get("search_terms") or []),
+                    "broader_terms": self._normalize_broad_literature_terms(fallback_item.get("broader_terms") or []),
                     "rationale": str(fallback_item.get("rationale") or "").strip(),
                 }
             )
 
-        shared_terms = self._normalize_search_terms(payload.get("shared_terms") or [])
-        shared_broader_terms = self._normalize_search_terms(payload.get("shared_broader_terms") or [])
+        shared_terms = self._normalize_broad_literature_terms(payload.get("shared_terms") or [])
+        shared_broader_terms = self._normalize_broad_literature_terms(payload.get("shared_broader_terms") or [])
         if not shared_terms and not shared_broader_terms:
-            shared_terms = self._normalize_search_terms(fallback.get("shared_terms", []))
-            shared_broader_terms = self._normalize_search_terms(fallback.get("shared_broader_terms", []))
+            shared_terms = self._normalize_broad_literature_terms(fallback.get("shared_terms", []))
+            shared_broader_terms = self._normalize_broad_literature_terms(fallback.get("shared_broader_terms", []))
         notes = coerce_string_list(payload.get("notes", [])) or fallback.get("notes", [])
         return {
             "ideas": ideas_payload,
