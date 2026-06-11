@@ -1059,6 +1059,13 @@ class LiteratureMixin:
             candidates,
         )
         planned_queries = [planned_query] if planned_query else []
+        logger.info(
+            "Cycle prior-art literature prefetch: ideas=%d query_count=%d results_per_query=%d term_count=%d",
+            len(candidates),
+            len(planned_queries),
+            results_per_query,
+            planned_query.count(" OR ") + 1 if planned_query else 0,
+        )
 
         prefetch = self.literature_service.prefetch_corpus(
             planned_queries,

@@ -50,7 +50,7 @@ enable_opencode_reranking: true
 opencode_rerank_timeout_seconds: 900
 enable_safety_review: true
 enable_prior_art_check: true
-# One full-cycle OR query is sent to each paper source before local recall.
+# Prior-art prefetch builds one full-cycle OR query and fetches 1000 papers per source by default.
 cycle_literature_terms_per_idea: 6
 cycle_literature_shared_terms: 12
 cycle_literature_results_per_query: 1000
