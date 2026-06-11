@@ -245,6 +245,69 @@ Required JSON schema:
     ]
 
 
+def build_cycle_literature_query_planning_messages(
+    research_goal: str,
+    research_plan: Dict[str, Any],
+    ideas: List[Dict[str, Any]],
+    search_context: Dict[str, Any],
+    max_terms_per_idea: int,
+    max_shared_terms: int,
+    max_queries: int,
+) -> List[Dict[str, str]]:
+    prompt = f"""
+Plan a high-recall literature sweep for the full cycle at once.
+Read every idea together and extract search vocabulary that should retrieve relevant papers.
+The downstream system will combine terms with OR and run a small number of broad searches.
+Do not plan single-query searches one idea at a time.
+
+Research goal:
+{research_goal}
+
+Research plan:
+{_json_block(research_plan)}
+
+Cycle ideas:
+{_json_block({"ideas": ideas})}
+
+Search context:
+{_json_block(search_context)}
+
+Search budget:
+- At most {max_queries} broad OR queries in total.
+- Prefer {max_terms_per_idea} or fewer search terms per idea.
+- Prefer up to {max_shared_terms} shared terms for the whole cycle.
+
+Guidelines:
+- Return short search phrases, task names, method names, dataset names, and mechanism vocabulary.
+- Think like an academic search expert: maximize recall, not elegance.
+- Use vocabulary that would appear in titles and abstracts.
+- Some terms may be shared across multiple ideas.
+- Avoid duplicate or near-duplicate terms.
+- Do not emit full boolean queries; the code will combine the terms with OR.
+- No markdown, no explanation outside the JSON schema.
+
+Required JSON schema:
+{{
+  "ideas": [
+    {{
+      "idea_id": "string",
+      "idea_title": "string",
+      "search_terms": ["string"],
+      "broader_terms": ["string"],
+      "rationale": "string"
+    }}
+  ],
+  "shared_terms": ["string"],
+  "shared_broader_terms": ["string"],
+  "notes": ["string"]
+}}
+"""
+    return [
+        {"role": "system", "content": BASE_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt.strip()},
+    ]
+
+
 def build_generation_messages(
     research_goal: str,
     research_plan: Dict[str, Any],

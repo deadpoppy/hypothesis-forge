@@ -97,6 +97,11 @@ class ArxivSearchTool:
             sort_criterion = arxiv.SortCriterion.LastUpdatedDate
         elif sort_by == "submittedDate":
             sort_criterion = arxiv.SortCriterion.SubmittedDate
+
+        client = self.client
+        client_page_size = getattr(client, "page_size", None)
+        if isinstance(client_page_size, int) and max_results > client_page_size:
+            client = arxiv.Client(page_size=min(max_results, 100), delay_seconds=0.5, num_retries=0)
             
         # Log search parameters
         logger.info(f"ArXiv search initiated - Query: '{query}', Max Results: {max_results}, "
@@ -116,7 +121,7 @@ class ArxivSearchTool:
                 start_time = time.time()
 
                 papers = []
-                for paper in self.client.results(search):
+                for paper in client.results(search):
                     papers.append(self._format_paper(paper))
 
                 search_time = (time.time() - start_time) * 1000  # Convert to ms

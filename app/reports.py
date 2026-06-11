@@ -15,8 +15,10 @@ def _format_list(items: List[Any]) -> str:
 
 def _top_hypotheses(cycle: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
     final_step = (
-        cycle.get("steps", {}).get("codex_reranking_final")
+        cycle.get("steps", {}).get("opencode_reranking_final")
+        or cycle.get("steps", {}).get("codex_reranking_final")
         or cycle.get("steps", {}).get("ranking_final")
+        or cycle.get("steps", {}).get("opencode_reranking")
         or cycle.get("steps", {}).get("codex_reranking")
         or cycle.get("steps", {}).get("ranking")
         or {}
@@ -130,19 +132,21 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
                 if latest_review.get("weaknesses"):
                     parts.append(_line("Weaknesses:"))
                     parts.append(_format_list(latest_review.get("weaknesses", [])[:5]))
-            codex_reviews = hypothesis.get("codex_rerank_reviews", [])
-            if codex_reviews:
-                latest_codex = codex_reviews[-1]
-                parts.append(_line("Codex rerank review:"))
-                parts.append(_line(f"Rank: `{latest_codex.get('rank', 'n/a')}`"))
-                if latest_codex.get("summary"):
-                    parts.append(_line(latest_codex.get("summary", "")))
-                if latest_codex.get("weaknesses"):
-                    parts.append(_line("Codex weaknesses:"))
-                    parts.append(_format_list(latest_codex.get("weaknesses", [])[:4]))
-                if latest_codex.get("novelty_risks"):
-                    parts.append(_line("Codex novelty risks:"))
-                    parts.append(_format_list(latest_codex.get("novelty_risks", [])[:4]))
+            opencode_reviews = hypothesis.get("opencode_rerank_reviews")
+            if opencode_reviews is None:
+                opencode_reviews = hypothesis.get("codex_rerank_reviews", [])
+            if opencode_reviews:
+                latest_opencode = opencode_reviews[-1]
+                parts.append(_line("OpenCode rerank review:"))
+                parts.append(_line(f"Rank: `{latest_opencode.get('rank', 'n/a')}`"))
+                if latest_opencode.get("summary"):
+                    parts.append(_line(latest_opencode.get("summary", "")))
+                if latest_opencode.get("weaknesses"):
+                    parts.append(_line("OpenCode weaknesses:"))
+                    parts.append(_format_list(latest_opencode.get("weaknesses", [])[:4]))
+                if latest_opencode.get("novelty_risks"):
+                    parts.append(_line("OpenCode novelty risks:"))
+                    parts.append(_format_list(latest_opencode.get("novelty_risks", [])[:4]))
             prior_art_audit = hypothesis.get("prior_art_audit", {})
             if isinstance(prior_art_audit, dict) and prior_art_audit:
                 parts.append(_line(f"Prior-art risk: `{prior_art_audit.get('novelty_risk', 'unknown')}`"))
@@ -164,10 +168,18 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
                 parts.append(_line("Validation experiments:"))
                 parts.append(_format_list(experiments))
         parts.append(_line("### Ranking Diagnostics"))
-        for step_name in ("ranking", "codex_reranking", "ranking_final", "codex_reranking_final"):
+        ranking_steps = (
+            ("ranking", ""),
+            ("opencode_reranking", "codex_reranking"),
+            ("ranking_final", ""),
+            ("opencode_reranking_final", "codex_reranking_final"),
+        )
+        for step_name, legacy_step_name in ranking_steps:
             step = cycle.get("steps", {}).get(step_name, {})
+            if not step and legacy_step_name:
+                step = cycle.get("steps", {}).get(legacy_step_name, {})
             if step:
-                if step_name.startswith("codex"):
+                if step_name.startswith("opencode"):
                     parts.append(
                         _line(
                             f"- {step_name}: status={step.get('status', 'n/a')}, "

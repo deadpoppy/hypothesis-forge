@@ -525,7 +525,7 @@ class Hypothesis:
     prior_art_repair_count: int = 0
     debate_history: List[Dict[str, Any]] = field(default_factory=list)
     review_artifacts: List[Dict[str, Any]] = field(default_factory=list)
-    codex_rerank_reviews: List[Dict[str, Any]] = field(default_factory=list)
+    opencode_rerank_reviews: List[Dict[str, Any]] = field(default_factory=list)
     is_active: bool = True
     created_in_iteration: int = 0
 
@@ -599,7 +599,11 @@ class Hypothesis:
             prior_art_repair_count=prior_art_repair_count,
             debate_history=_dict_list(data.get("debate_history")),
             review_artifacts=_dict_list(data.get("review_artifacts")),
-            codex_rerank_reviews=_dict_list(data.get("codex_rerank_reviews")),
+            opencode_rerank_reviews=_dict_list(
+                data.get("opencode_rerank_reviews")
+                if "opencode_rerank_reviews" in data
+                else data.get("codex_rerank_reviews")
+            ),
             is_active=bool(data.get("is_active", True)),
             created_in_iteration=max(0, created_in_iteration),
         )
@@ -698,7 +702,7 @@ class Hypothesis:
             "parent_ids": self.parent_ids,
             "verdict": self.review_verdict,
             "latest_review": self.review_artifacts[-1] if self.review_artifacts else {},
-            "latest_codex_rerank": self.codex_rerank_reviews[-1] if self.codex_rerank_reviews else {},
+            "latest_opencode_rerank": self.opencode_rerank_reviews[-1] if self.opencode_rerank_reviews else {},
         }
 
     def comparison_signature(self) -> str:
@@ -730,7 +734,7 @@ class Hypothesis:
             "scores": self.scores,
             "references": self.references,
             "review_artifacts": self.review_artifacts[-3:],
-            "codex_rerank_reviews": self.codex_rerank_reviews[-3:],
+            "opencode_rerank_reviews": self.opencode_rerank_reviews[-3:],
             "is_active": self.is_active,
         }
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -804,7 +808,7 @@ class Hypothesis:
             "prior_art_repair_count": self.prior_art_repair_count,
             "debate_history": self.debate_history,
             "review_artifacts": self.review_artifacts,
-            "codex_rerank_reviews": self.codex_rerank_reviews,
+            "opencode_rerank_reviews": self.opencode_rerank_reviews,
             "is_active": self.is_active,
             "created_in_iteration": self.created_in_iteration,
         }
@@ -832,7 +836,7 @@ class StepResult:
 class ContextMemory:
     hypotheses: Dict[str, Hypothesis] = field(default_factory=dict)
     tournament_results: List[Dict[str, Any]] = field(default_factory=list)
-    codex_rerank_history: List[Dict[str, Any]] = field(default_factory=list)
+    opencode_rerank_history: List[Dict[str, Any]] = field(default_factory=list)
     meta_review_feedback: List[Dict[str, Any]] = field(default_factory=list)
     research_overviews: List[Dict[str, Any]] = field(default_factory=list)
     cycle_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -863,7 +867,11 @@ class ContextMemory:
                     context.add_hypothesis(Hypothesis.from_dict(value))
 
         context.tournament_results = _dict_list(data.get("tournament_results"))
-        context.codex_rerank_history = _dict_list(data.get("codex_rerank_history"))
+        context.opencode_rerank_history = _dict_list(
+            data.get("opencode_rerank_history")
+            if "opencode_rerank_history" in data
+            else data.get("codex_rerank_history")
+        )
         context.meta_review_feedback = _dict_list(data.get("meta_review_feedback"))
         context.research_overviews = _dict_list(data.get("research_overviews"))
         context.cycle_history = _dict_list(data.get("cycle_history"))
@@ -895,7 +903,7 @@ class ContextMemory:
     def reset_for_goal(self, research_goal: ResearchGoal) -> None:
         self.hypotheses.clear()
         self.tournament_results.clear()
-        self.codex_rerank_history.clear()
+        self.opencode_rerank_history.clear()
         self.meta_review_feedback.clear()
         self.research_overviews.clear()
         self.cycle_history.clear()
@@ -968,7 +976,7 @@ class ContextMemory:
         return {
             "hypotheses": {key: hypothesis.to_dict() for key, hypothesis in self.hypotheses.items()},
             "tournament_results": self.tournament_results,
-            "codex_rerank_history": self.codex_rerank_history,
+            "opencode_rerank_history": self.opencode_rerank_history,
             "meta_review_feedback": self.meta_review_feedback,
             "research_overviews": self.research_overviews,
             "cycle_history": self.cycle_history,

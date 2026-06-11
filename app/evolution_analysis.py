@@ -90,7 +90,15 @@ def analyze_evolution_payload(data: Dict[str, Any], label: str = "") -> Dict[str
         steps = cycle.get("steps", {})
         generation_step = steps.get("generation") or {}
         evolution_step = steps.get("evolution") or {}
-        final_step = steps.get("codex_reranking_final") or steps.get("ranking_final") or steps.get("codex_reranking") or steps.get("ranking") or {}
+        final_step = (
+            steps.get("opencode_reranking_final")
+            or steps.get("codex_reranking_final")
+            or steps.get("ranking_final")
+            or steps.get("opencode_reranking")
+            or steps.get("codex_reranking")
+            or steps.get("ranking")
+            or {}
+        )
         ranked_hypotheses = sorted(_safe_hypotheses(final_step), key=lambda item: item.get("elo_score", 0), reverse=True)
         top3 = ranked_hypotheses[:3]
         cycle_summaries.append(
@@ -104,7 +112,10 @@ def analyze_evolution_payload(data: Dict[str, Any], label: str = "") -> Dict[str
                 "evolution_duration": round(_step_duration(evolution_step), 2),
                 "review_evolved_duration": round(_step_duration(steps.get("review_evolved")), 2),
                 "ranking_final_duration": round(_step_duration(steps.get("ranking_final")), 2),
-                "codex_reranking_final_duration": round(_step_duration(steps.get("codex_reranking_final")), 2),
+                "opencode_reranking_final_duration": round(
+                    _step_duration(steps.get("opencode_reranking_final") or steps.get("codex_reranking_final")),
+                    2,
+                ),
                 "focus_coverage_top3": _coverage_count(requested_focus_areas, top3),
                 "top3_titles": [str(item.get("title") or "") for item in top3],
                 "top3_origins": [str(item.get("origin") or "") for item in top3],
@@ -172,7 +183,7 @@ def build_markdown_summary(reports: Sequence[Dict[str, Any]]) -> str:
                 f"({cycle['evolution_duration']}s), "
                 f"review_evolved={cycle['review_evolved_duration']}s, "
                 f"ranking_final={cycle['ranking_final_duration']}s, "
-                f"codex_reranking_final={cycle['codex_reranking_final_duration']}s, "
+                f"opencode_reranking_final={cycle['opencode_reranking_final_duration']}s, "
                 f"top3={cycle['top3_titles']}\n"
             )
         parts.append("\n### Top Lineages\n")

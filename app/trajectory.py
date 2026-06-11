@@ -54,8 +54,10 @@ def _dominant_focus_share(items: Sequence[Dict[str, Any]]) -> float:
 
 def _top_hypotheses_from_cycle(cycle: Dict[str, Any], limit: int = 3) -> List[Dict[str, Any]]:
     final_step = (
-        cycle.get("steps", {}).get("codex_reranking_final")
+        cycle.get("steps", {}).get("opencode_reranking_final")
+        or cycle.get("steps", {}).get("codex_reranking_final")
         or cycle.get("steps", {}).get("ranking_final")
+        or cycle.get("steps", {}).get("opencode_reranking")
         or cycle.get("steps", {}).get("codex_reranking")
         or cycle.get("steps", {}).get("ranking")
         or {}

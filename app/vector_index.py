@@ -102,21 +102,20 @@ class PaperVectorIndex:
             return []
 
         query_embedding = self._query_embedding(self.query_prefix + query_text)
-        scores = self._search_scores(query_embedding, embeddings)
         limit = min(top_k, len(indexed_notes))
         if limit <= 0:
             return []
 
-        top_indices = np.argsort(-scores, kind="mergesort")[:limit]
+        top_matches = self._search_top_matches(query_embedding, embeddings, limit)
         backend = "faiss" if self._faiss_index is not None else "numpy"
         return [
             {
                 "note": indexed_notes[int(index)],
-                "semantic_score": self._normalize_score(float(scores[int(index)])),
+                "semantic_score": self._normalize_score(float(score)),
                 "vector_rank": rank,
                 "vector_index_backend": backend,
             }
-            for rank, index in enumerate(top_indices, start=1)
+            for rank, (index, score) in enumerate(top_matches, start=1)
         ]
 
     def _load_or_build(
@@ -178,20 +177,46 @@ class PaperVectorIndex:
         norms[norms <= 0.0] = 1.0
         return (embeddings / norms).astype(np.float32, copy=False)
 
-    def _search_scores(self, query_embedding: np.ndarray, embeddings: np.ndarray) -> np.ndarray:
+    def _search_top_matches(
+        self,
+        query_embedding: np.ndarray,
+        embeddings: np.ndarray,
+        top_k: int,
+    ) -> List[tuple[int, float]]:
+        if top_k <= 0:
+            return []
         if self._use_faiss(embeddings):
-            scores, indices = self._faiss_index.search(query_embedding.reshape(1, -1).astype(np.float32), len(embeddings))
-            ordered_scores = np.full(len(embeddings), -1.0, dtype=np.float32)
+            scores, indices = self._faiss_index.search(query_embedding.reshape(1, -1).astype(np.float32), top_k)
+            matches = []
             for score, index in zip(scores[0], indices[0]):
                 if index >= 0:
-                    ordered_scores[int(index)] = float(score)
-            return ordered_scores
+                    matches.append((int(index), float(score)))
+            return sorted(matches, key=lambda item: (-item[1], item[0]))[:top_k]
 
-        scores = np.empty(len(embeddings), dtype=np.float32)
+        best_indices = np.empty(0, dtype=np.int64)
+        best_scores = np.empty(0, dtype=np.float32)
         for start in range(0, len(embeddings), self.search_chunk_size):
             end = min(start + self.search_chunk_size, len(embeddings))
-            scores[start:end] = embeddings[start:end] @ query_embedding
-        return scores
+            chunk_scores = embeddings[start:end] @ query_embedding
+            chunk_limit = min(top_k, len(chunk_scores))
+            if chunk_limit <= 0:
+                continue
+            if chunk_limit < len(chunk_scores):
+                chunk_top = np.argpartition(-chunk_scores, chunk_limit - 1)[:chunk_limit]
+            else:
+                chunk_top = np.arange(len(chunk_scores))
+            candidate_indices = np.concatenate([best_indices, chunk_top.astype(np.int64) + start])
+            candidate_scores = np.concatenate([best_scores, chunk_scores[chunk_top].astype(np.float32, copy=False)])
+            candidate_limit = min(top_k, len(candidate_scores))
+            if candidate_limit < len(candidate_scores):
+                keep = np.argpartition(-candidate_scores, candidate_limit - 1)[:candidate_limit]
+            else:
+                keep = np.arange(len(candidate_scores))
+            best_indices = candidate_indices[keep]
+            best_scores = candidate_scores[keep]
+
+        matches = [(int(index), float(score)) for index, score in zip(best_indices, best_scores)]
+        return sorted(matches, key=lambda item: (-item[1], item[0]))[:top_k]
 
     def _use_faiss(self, embeddings: np.ndarray) -> bool:
         if self.backend == "numpy":

@@ -5,10 +5,10 @@ import time
 from typing import Callable, Dict, List
 
 from .agents import (
-    CodexRerankingAgent,
     EvolutionAgent,
     GenerationAgent,
     MetaReviewAgent,
+    OpenCodeRerankingAgent,
     PriorArtAgent,
     ProximityAgent,
     RankingAgent,
@@ -31,7 +31,7 @@ class SupervisorAgent:
         self.reflection_agent = ReflectionAgent()
         self.proximity_agent = ProximityAgent()
         self.ranking_agent = RankingAgent()
-        self.codex_reranking_agent = CodexRerankingAgent()
+        self.opencode_reranking_agent = OpenCodeRerankingAgent()
         self.evolution_agent = EvolutionAgent()
         self.meta_review_agent = MetaReviewAgent()
 
@@ -127,13 +127,13 @@ class SupervisorAgent:
         self._add_step(cycle_details, ranking_result)
         emit_progress("ranking")
 
-        codex_reranking_result = self.codex_reranking_agent.rerank_top_hypotheses(
+        opencode_reranking_result = self.opencode_reranking_agent.rerank_top_hypotheses(
             research_goal=research_goal,
             context=context,
-            step_name="codex_reranking",
+            step_name="opencode_reranking",
         )
-        self._add_step(cycle_details, codex_reranking_result)
-        emit_progress("codex_reranking")
+        self._add_step(cycle_details, opencode_reranking_result)
+        emit_progress("opencode_reranking")
 
         evolution_result = self.evolution_agent.evolve_hypotheses(research_goal, context)
         self._add_step(cycle_details, evolution_result)
@@ -181,13 +181,13 @@ class SupervisorAgent:
         self._add_step(cycle_details, ranking_final_result)
         emit_progress("ranking_final")
 
-        codex_reranking_final = self.codex_reranking_agent.rerank_top_hypotheses(
+        opencode_reranking_final = self.opencode_reranking_agent.rerank_top_hypotheses(
             research_goal=research_goal,
             context=context,
-            step_name="codex_reranking_final",
+            step_name="opencode_reranking_final",
         )
-        self._add_step(cycle_details, codex_reranking_final)
-        emit_progress("codex_reranking_final")
+        self._add_step(cycle_details, opencode_reranking_final)
+        emit_progress("opencode_reranking_final")
 
         meta_review_result = self.meta_review_agent.summarize_and_feedback(
             research_goal=research_goal,

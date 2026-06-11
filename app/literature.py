@@ -13,7 +13,7 @@ from dateutil import parser as date_parser
 from .config import config
 from .tools.arxiv_search import ArxivSearchTool
 from .tools.semantic_scholar import SemanticScholarSearchTool
-from .utils import get_max_concurrency, logger, run_concurrently
+from .utils import dedupe_preserve_order, get_max_concurrency, logger, run_concurrently
 
 
 def _normalize_query(query: str) -> str:
@@ -305,90 +305,150 @@ class LiteratureSearchService:
             return []
 
         candidate_limit = max(max_results * 4, max_results)
+        clean_queries = dedupe_preserve_order([str(item).strip() for item in queries if str(item).strip()])
+        if not clean_queries:
+            return []
+
         all_notes: List[Dict[str, Any]] = []
-        for query in [item.strip() for item in queries if str(item).strip()]:
+        cache_counts: Dict[str, int] = {}
+        for query in clean_queries:
             cached_notes = self.cache.search_cached_notes(query, candidate_limit)
+            cache_counts[query] = len(cached_notes)
             all_notes.extend(cached_notes)
 
-            live_notes, source_counts = self._search_live_sources(query, candidate_limit)
-            if not live_notes and not cached_notes:
-                logger.warning("No literature results found for query '%s' from cache, Semantic Scholar, or arXiv.", query)
-            else:
-                logger.info("Literature query '%s' returned cache=%d live=%s", query, len(cached_notes), source_counts)
-            all_notes.extend(live_notes)
+        live_notes, source_counts, query_source_counts = self._search_live_source_batch(
+            clean_queries,
+            max_results=candidate_limit,
+            use_exact_cache=False,
+        )
+        all_notes.extend(live_notes)
+
+        if not live_notes and not all_notes:
+            logger.warning("No literature results found for %d batched queries from cache, Semantic Scholar, or arXiv.", len(clean_queries))
+        else:
+            logger.info(
+                "Batched literature search returned queries=%d cache=%d live=%s",
+                len(clean_queries),
+                sum(cache_counts.values()),
+                source_counts,
+            )
+            logger.debug("Batched literature query/source counts: %s", query_source_counts)
 
         return _select_literature_notes(all_notes, max_results=max_results, sample_seed=sample_seed)
 
-    def search_corpus(
+    def prefetch_corpus(
         self,
         queries: Sequence[str],
         results_per_query: int,
         max_total: int | None = None,
-    ) -> List[Dict[str, Any]]:
-        if results_per_query <= 0:
+    ) -> Dict[str, Any]:
+        clean_queries = dedupe_preserve_order([str(item).strip() for item in queries if str(item).strip()])
+        if results_per_query <= 0 or not clean_queries:
+            return {
+                "queries": clean_queries,
+                "query_count": len(clean_queries),
+                "results_per_query": max(0, results_per_query),
+                "fetched_count": 0,
+                "local_corpus_size": len(self.local_corpus(max_total=max_total)),
+                "source_counts": {},
+                "query_source_counts": {},
+            }
+
+        cached_notes: List[Dict[str, Any]] = []
+        cache_counts: Dict[str, int] = {}
+        for query in clean_queries:
+            matches = self.cache.search_cached_notes(query, results_per_query)
+            cache_counts[query] = len(matches)
+            cached_notes.extend(matches)
+
+        live_notes, source_counts, query_source_counts = self._search_live_source_batch(
+            clean_queries,
+            max_results=results_per_query,
+            use_exact_cache=True,
+        )
+        fetched = dedupe_notes(cached_notes + live_notes)
+        local_corpus_size = len(self.local_corpus(max_total=max_total))
+
+        return {
+            "queries": clean_queries,
+            "query_count": len(clean_queries),
+            "results_per_query": results_per_query,
+            "fetched_count": len(fetched),
+            "local_corpus_size": local_corpus_size,
+            "source_counts": source_counts,
+            "query_source_counts": query_source_counts,
+            "cache_counts": cache_counts,
+            "sample_titles": [str(note.get("title") or "") for note in fetched[:8] if note.get("title")],
+        }
+
+    def local_corpus(self, max_total: int | None = None) -> List[Dict[str, Any]]:
+        if not bool(config.get("prior_art_include_cache_corpus", True)):
             return []
-
-        all_notes: List[Dict[str, Any]] = []
-        for query in [item.strip() for item in queries if str(item).strip()]:
-            cached_notes = self.cache.search_cached_notes(query, results_per_query)
-            all_notes.extend(cached_notes)
-
-            live_notes, source_counts = self._search_live_sources(query, results_per_query)
-            if not live_notes and not cached_notes:
-                logger.warning("No prior-art corpus results found for query '%s'.", query)
-            else:
-                logger.info(
-                    "Prior-art corpus query '%s' returned cache=%d live=%s",
-                    query,
-                    len(cached_notes),
-                    source_counts,
-                )
-            all_notes.extend(live_notes)
-
-        if bool(config.get("prior_art_include_cache_corpus", True)):
-            all_notes.extend(self.cache.all_notes())
-
-        deduped = dedupe_notes(all_notes)
+        notes = self.cache.all_notes()
         if max_total is not None:
-            return deduped[:max(0, max_total)]
-        return deduped
+            return notes[:max(0, max_total)]
+        return notes
 
-    def _search_live_sources(self, query: str, max_results: int) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    def _search_live_source_batch(
+        self,
+        queries: Sequence[str],
+        max_results: int,
+        use_exact_cache: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, int]]]:
         tasks = []
-        if self._semantic_scholar_enabled():
-            tasks.append(("semantic_scholar", query))
-        if "arxiv" in self.sources:
-            tasks.append(("arxiv", query))
+        for query in [str(item).strip() for item in queries if str(item).strip()]:
+            if self._semantic_scholar_enabled():
+                tasks.append(("semantic_scholar", query))
+            if "arxiv" in self.sources:
+                tasks.append(("arxiv", query))
 
-        def run_source(task: Tuple[str, str]) -> Tuple[str, List[Dict[str, Any]]]:
+        def run_source(task: Tuple[str, str]) -> Tuple[str, str, List[Dict[str, Any]]]:
             source, task_query = task
-            if source == "semantic_scholar":
-                cached = self.cache.get(source, task_query)
-                if hasattr(self.semantic_scholar_tool, "search_papers_bulk"):
-                    papers = self.semantic_scholar_tool.search_papers_bulk(task_query, max_results=max_results)
-                else:
-                    papers = self.semantic_scholar_tool.search_papers(task_query, max_results=max_results)
-                notes = [self._semantic_scholar_note(paper) for paper in papers]
-                if notes:
-                    self.cache.set(source, task_query, notes)
-                    return source, notes
-                return source, cached
-
-            cached = self.cache.get(source, task_query)
-            papers = self.arxiv_tool.search_papers(query=task_query, max_results=max_results, sort_by="relevance")
-            notes = [self._arxiv_note(paper) for paper in papers]
-            if notes:
-                self.cache.set(source, task_query, notes)
-                return source, notes
-            return source, cached
+            return task_query, source, self._search_one_source(
+                source,
+                task_query,
+                max_results=max_results,
+                use_exact_cache=use_exact_cache,
+            )
 
         results = run_concurrently(tasks, run_source, max_workers=min(get_max_concurrency(), len(tasks) or 1))
         notes: List[Dict[str, Any]] = []
         source_counts: Dict[str, int] = {}
-        for source, source_notes in results:
-            source_counts[source] = len(source_notes)
+        query_source_counts: Dict[str, Dict[str, int]] = {}
+        for task_query, source, source_notes in results:
+            source_counts[source] = source_counts.get(source, 0) + len(source_notes)
+            query_source_counts.setdefault(task_query, {})[source] = len(source_notes)
             notes.extend(source_notes)
-        return dedupe_notes(notes), source_counts
+        return dedupe_notes(notes), source_counts, query_source_counts
+
+    def _search_one_source(
+        self,
+        source: str,
+        query: str,
+        max_results: int,
+        use_exact_cache: bool,
+    ) -> List[Dict[str, Any]]:
+        cached = self.cache.get(source, query)
+        if use_exact_cache and cached:
+            return cached
+
+        if source == "semantic_scholar":
+            if hasattr(self.semantic_scholar_tool, "search_papers_bulk"):
+                papers = self.semantic_scholar_tool.search_papers_bulk(query, max_results=max_results)
+            else:
+                papers = self.semantic_scholar_tool.search_papers(query, max_results=max_results)
+            notes = [self._semantic_scholar_note(paper) for paper in papers]
+            if notes:
+                self.cache.set(source, query, notes)
+                return notes
+            return cached
+
+        papers = self.arxiv_tool.search_papers(query=query, max_results=max_results, sort_by="relevance")
+        notes = [self._arxiv_note(paper) for paper in papers]
+        if notes:
+            self.cache.set(source, query, notes)
+            return notes
+        return cached
 
     def _semantic_scholar_note(self, paper: Dict[str, Any]) -> Dict[str, Any]:
         title = str(paper.get("title") or "").strip()

@@ -15,7 +15,7 @@ For agents: copy `config.example.yaml` to `config.yaml`, set `thinking_llm` and 
 - Converts and summarizes the reference paper with the installed `arxiv2md` package before ideation.
 - Retrieves literature from Semantic Scholar and arXiv for grounding.
 - Runs larger-pool prior-art checks to catch duplicate or weakly differentiated ideas.
-- Reviews hypotheses with one consolidated critic pass and reranks the current top four ideas with `codex exec --yolo -m gpt-5.4`.
+- Reviews hypotheses with one consolidated critic pass and reranks the current top four ideas with `opencode run --dangerously-skip-permissions`.
 - Tracks trajectory quality, diversity, stability, and failure modes.
 - Saves timestamped reports plus live checkpoints for long runs.
 
@@ -49,6 +49,8 @@ pip install -r requirements.txt
 ```
 
 The install includes `sentence-transformers` and `torch` because prior-art recall and hypothesis proximity scoring use semantic embedding similarity for the full workflow. `scikit-learn` and `numpy` are not listed directly because the repository code does not import them.
+
+The top-four reranking stage also requires the `opencode` CLI to be installed and available on `PATH`.
 
 ## Configuration
 
@@ -105,13 +107,17 @@ sentence_transformer_enabled: true
 sentence_transformer_model: "BAAI/bge-small-en-v1.5"
 sentence_transformer_local_files_only: false
 prior_art_include_cache_corpus: true
+cycle_literature_queries_per_idea: 2
+cycle_literature_max_queries: 24
+cycle_literature_results_per_query: 100
+literature_or_terms_per_query: 4
 prior_art_embedding_candidates: 200
 prior_art_vector_index_path: ".cache/prior_art_vector_index.npz"
 prior_art_vector_index_backend: "auto"
 prior_art_query_prefix: ""
 ```
 
-Prior-art recall uses a persistent embedding index over the retrieved corpus plus the local literature cache, so large local libraries do not need to be re-embedded on every audit. Query and paper embeddings use a compact `Title:` + `Abstract:` text format. The `auto` backend uses FAISS when it is installed and falls back to exact numpy search otherwise. Keep `sentence_transformer_local_files_only: true` only after the configured embedding model is already cached locally.
+Prior-art recall now batch-plans search terms for the whole cycle's idea set, bundles them into a small number of OR queries, writes the resulting papers into the cache, and then reuses the local literature cache as the embedding corpus for per-idea checks. Other online literature grounding also bundles plain candidate terms before calling the paper sources. Query and paper embeddings use a compact `Title:` + `Abstract:` text format. The `auto` backend uses FAISS when it is installed and falls back to chunked numpy search otherwise. Keep `sentence_transformer_local_files_only: true` only after the configured embedding model is already cached locally.
 
 ## Quick Start
 
@@ -133,8 +139,8 @@ top_k_hypotheses: 3
 ranking_matches_per_cycle: 1000
 max_literature_results: 6
 max_concurrency: 16
-enable_codex_reranking: true
-codex_rerank_model: "gpt-5.4"
+enable_opencode_reranking: true
+opencode_rerank_timeout_seconds: 900
 ```
 
 You can override any of these from the CLI when needed:
@@ -215,7 +221,7 @@ python -m unittest discover -s tests
 ## Operational Notes
 
 - The required reference paper is converted through the installed `arxiv2md` package, then summarized by the thinking LLM before the workflow starts.
-- Top-four reranking calls the Codex CLI as `codex exec --yolo -m gpt-5.4`; set `enable_codex_reranking: false` only for smoke tests without Codex CLI.
+- Top-four reranking calls OpenCode as `opencode run --dangerously-skip-permissions "<prompt>"`; set `enable_opencode_reranking: false` only for smoke tests without the OpenCode CLI.
 - arXiv `429` responses trigger a cooldown saved at `arxiv_state_path`.
 - Reference paper conversion uses the `arxiv2md` package installed in the same
   Python environment that runs Hypothesis Forge. If conversion fails with an

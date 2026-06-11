@@ -43,11 +43,15 @@ max_concurrency: 16
 elo_k_factor: 32
 proximity_similarity_threshold: 0.55
 hypothesis_decay_fraction: 0.0
-enable_codex_reranking: true
-codex_rerank_model: "gpt-5.4"
-codex_rerank_timeout_seconds: 900
+enable_opencode_reranking: true
+opencode_rerank_timeout_seconds: 900
 enable_safety_review: true
 enable_prior_art_check: true
+# Batch prior-art prefetch plans OR-bundled queries for the full idea set before local recall.
+cycle_literature_queries_per_idea: 2
+cycle_literature_max_queries: 24
+cycle_literature_results_per_query: 100
+literature_or_terms_per_query: 4
 prior_art_queries_per_idea: 6
 prior_art_results_per_query: 50
 prior_art_embedding_candidates: 200

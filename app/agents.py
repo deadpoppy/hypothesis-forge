@@ -20,6 +20,7 @@ from .prompts import (
     build_generation_refill_messages,
     build_generation_messages,
     build_goal_safety_review_messages,
+    build_cycle_literature_query_planning_messages,
     build_literature_query_planning_messages,
     build_meta_review_messages,
     build_prior_art_audit_messages,
@@ -84,6 +85,25 @@ def _compose_hypothesis_text(payload: Dict[str, Any]) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def _hypothesis_recall_text(hypothesis: Hypothesis) -> str:
+    abstract = hypothesis.text.strip()
+    if not abstract:
+        abstract = " ".join(
+            part
+            for part in [
+                hypothesis.problem_framing,
+                hypothesis.central_insight,
+                hypothesis.mechanism,
+                hypothesis.rationale,
+            ]
+            if str(part).strip()
+        )
+    return title_abstract_recall_text(
+        hypothesis.title,
+        abstract,
+    )
+
+
 def _round_score(value: float) -> float:
     return round(float(value), 4)
 
@@ -104,7 +124,7 @@ def _build_review_artifact(hypothesis: Hypothesis) -> Dict[str, Any]:
         "validation_experiments": hypothesis.validation_experiments[:4],
         "references": hypothesis.references[:5],
         "latest_review": hypothesis.review_artifacts[-1] if hypothesis.review_artifacts else {},
-        "latest_codex_rerank": hypothesis.codex_rerank_reviews[-1] if hypothesis.codex_rerank_reviews else {},
+        "latest_opencode_rerank": hypothesis.opencode_rerank_reviews[-1] if hypothesis.opencode_rerank_reviews else {},
     }
 
 
@@ -652,7 +672,8 @@ class LiteratureMixin:
         max_results: int,
         sample_seed: str | None = None,
     ) -> List[Dict[str, Any]]:
-        return self.literature_service.search(queries, max_results=max_results, sample_seed=sample_seed)
+        bundled_queries = self._bundle_online_literature_queries(queries)
+        return self.literature_service.search(bundled_queries, max_results=max_results, sample_seed=sample_seed)
 
     def _build_queries(self, research_goal: ResearchGoal, research_plan: ResearchPlan, hypothesis: Hypothesis | None = None) -> List[str]:
         queries = []
@@ -674,6 +695,7 @@ class LiteratureMixin:
         query_budget: int,
         context: ContextMemory | None = None,
         hypothesis: Hypothesis | None = None,
+        extra_search_context: Dict[str, Any] | None = None,
     ) -> List[str]:
         raw_queries = dedupe_preserve_order(candidate_queries)
         if query_budget <= 0:
@@ -694,6 +716,8 @@ class LiteratureMixin:
             search_context["latest_meta_review"] = context.latest_meta_review()
         if hypothesis is not None:
             search_context["hypothesis"] = hypothesis.compact_summary()
+        if extra_search_context:
+            search_context.update(extra_search_context)
 
         try:
             payload = _coerce_mapping(
@@ -728,6 +752,446 @@ class LiteratureMixin:
                 planned_queries.append(query)
 
         return dedupe_preserve_order(planned_queries + raw_queries)[:query_budget]
+
+    def _cycle_literature_idea_brief(self, hypothesis: Hypothesis) -> Dict[str, Any]:
+        return {
+            "idea_id": hypothesis.hypothesis_id,
+            "idea_title": hypothesis.title,
+            "focus_area": hypothesis.focus_area,
+            "primary_bottleneck": hypothesis.primary_bottleneck,
+            "summary": hypothesis.text or hypothesis.review_summary or hypothesis.title,
+            "search_queries": hypothesis.search_queries[:8],
+            "mechanism": hypothesis.mechanism,
+            "problem_framing": hypothesis.problem_framing,
+            "central_insight": hypothesis.central_insight,
+            "theoretical_story": hypothesis.theoretical_story,
+            "why_not_simple_combination": hypothesis.why_not_simple_combination,
+        }
+
+    def _normalize_search_terms(self, terms: Sequence[Any]) -> List[str]:
+        cleaned = []
+        for term in coerce_string_list(terms):
+            normalized = " ".join(str(term).replace('"', "").split())
+            if normalized:
+                cleaned.append(normalized)
+        return dedupe_preserve_order(cleaned)
+
+    def _quote_search_term(self, term: str) -> str:
+        value = " ".join(str(term).replace('"', "").split())
+        if not value:
+            return ""
+        if value.startswith('"') and value.endswith('"'):
+            return value
+        if re.search(r"\s", value) or "/" in value or "-" in value:
+            return f'"{value}"'
+        return value
+
+    def _or_query(self, terms: Sequence[Any]) -> str:
+        cleaned = []
+        seen = set()
+        for term in self._normalize_search_terms(terms):
+            token = self._quote_search_term(term)
+            if not token:
+                continue
+            dedupe_key = token.casefold()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            cleaned.append(token)
+        return " OR ".join(cleaned)
+
+    def _looks_like_boolean_query(self, query: str) -> bool:
+        return bool(re.search(r"\b(OR|AND|NOT)\b", str(query), flags=re.IGNORECASE))
+
+    def _bundle_online_literature_queries(self, queries: Sequence[str]) -> List[str]:
+        clean_queries = dedupe_preserve_order([str(item).strip() for item in queries if str(item).strip()])
+        if not clean_queries:
+            return []
+
+        try:
+            terms_per_query = int(config.get("literature_or_terms_per_query", 4))
+        except (TypeError, ValueError):
+            terms_per_query = 4
+        terms_per_query = max(2, min(8, terms_per_query))
+
+        prebuilt_queries: List[str] = []
+        plain_terms: List[str] = []
+        for query in clean_queries:
+            if self._looks_like_boolean_query(query):
+                prebuilt_queries.append(query)
+            else:
+                plain_terms.append(query)
+
+        chunks = [plain_terms[index : index + terms_per_query] for index in range(0, len(plain_terms), terms_per_query)]
+        if len(chunks) > 1 and len(chunks[-1]) == 1:
+            chunks[-2].extend(chunks[-1])
+            chunks.pop()
+
+        bundled = list(prebuilt_queries)
+        for chunk in chunks:
+            query = self._or_query(chunk)
+            if query:
+                bundled.append(query)
+        return dedupe_preserve_order(bundled)
+
+    def _build_default_cycle_literature_term_payload(
+        self,
+        research_goal: ResearchGoal,
+        research_plan: ResearchPlan,
+        hypotheses: Sequence[Hypothesis],
+    ) -> Dict[str, Any]:
+        idea_payload = []
+        for hypothesis in hypotheses:
+            fallback_terms = self._normalize_search_terms(
+                list(hypothesis.search_queries)
+                + [hypothesis.title, hypothesis.focus_area, hypothesis.primary_bottleneck]
+                + _focus_area_query_variants(hypothesis.focus_area)
+            )
+            idea_payload.append(
+                {
+                    "idea_id": hypothesis.hypothesis_id,
+                    "idea_title": hypothesis.title,
+                    "search_terms": fallback_terms[:6],
+                    "broader_terms": fallback_terms[6:10],
+                    "rationale": "fallback terms from the idea title, focus area, and stored search queries.",
+                }
+            )
+
+        shared_terms = self._normalize_search_terms(
+            list(research_plan.seed_queries)
+            + research_goal.reference_seed_queries()
+            + [research_goal.description]
+        )
+        return {
+            "ideas": idea_payload,
+            "shared_terms": shared_terms[:12],
+            "shared_broader_terms": shared_terms[12:20],
+            "notes": ["Fallback cycle term plan generated locally because the LLM planner was unavailable."],
+        }
+
+    def _plan_cycle_literature_terms(
+        self,
+        research_goal: ResearchGoal,
+        research_plan: ResearchPlan,
+        hypotheses: Sequence[Hypothesis],
+        context: ContextMemory,
+        step_name: str,
+        query_budget: int,
+    ) -> Dict[str, Any]:
+        fallback = self._build_default_cycle_literature_term_payload(research_goal, research_plan, hypotheses)
+        if not hypotheses:
+            return fallback
+
+        try:
+            max_terms_per_idea = int(config.get("cycle_literature_terms_per_idea", 6))
+        except (TypeError, ValueError):
+            max_terms_per_idea = 6
+        try:
+            max_shared_terms = int(config.get("cycle_literature_shared_terms", 12))
+        except (TypeError, ValueError):
+            max_shared_terms = 12
+        max_terms_per_idea = max(4, min(8, max_terms_per_idea))
+        max_shared_terms = max(6, min(16, max_shared_terms))
+        search_context: Dict[str, Any] = {
+            "step": step_name,
+            "iteration_number": context.iteration_number,
+            "latest_meta_review": context.latest_meta_review(),
+            "reference_paper": research_goal.reference_paper_context,
+            "hypotheses": [self._cycle_literature_idea_brief(hypothesis) for hypothesis in hypotheses],
+        }
+        try:
+            payload = _coerce_mapping(
+                call_json(
+                    build_cycle_literature_query_planning_messages(
+                        research_goal=research_goal.prompt_context(),
+                        research_plan=research_plan.to_dict(),
+                        ideas=[self._cycle_literature_idea_brief(hypothesis) for hypothesis in hypotheses],
+                        search_context=search_context,
+                        max_terms_per_idea=max_terms_per_idea,
+                        max_shared_terms=max_shared_terms,
+                        max_queries=query_budget,
+                    ),
+                    model=research_goal.llm_model,
+                    temperature=0.1,
+                    profile="thinking",
+                ),
+                fallback,
+            )
+        except LLMCallError as exc:
+            logger.warning("Cycle literature term planning failed for %s: %s", step_name, exc)
+            payload = fallback
+
+        ideas_payload = []
+        payload_ideas = payload.get("ideas", [])
+        if isinstance(payload_ideas, list):
+            for item in payload_ideas:
+                if not isinstance(item, dict):
+                    continue
+                idea_id = str(item.get("idea_id") or "").strip()
+                idea_title = str(item.get("idea_title") or "").strip()
+                search_terms = self._normalize_search_terms(item.get("search_terms") or item.get("terms") or [])
+                broader_terms = self._normalize_search_terms(item.get("broader_terms") or item.get("keywords") or [])
+                if not idea_id:
+                    continue
+                ideas_payload.append(
+                    {
+                        "idea_id": idea_id,
+                        "idea_title": idea_title,
+                        "search_terms": search_terms,
+                        "broader_terms": broader_terms,
+                        "rationale": str(item.get("rationale") or "").strip(),
+                    }
+                )
+
+        known_ids = {item["idea_id"] for item in ideas_payload}
+        for hypothesis in hypotheses:
+            if hypothesis.hypothesis_id in known_ids:
+                continue
+            fallback_item = next(
+                (item for item in fallback["ideas"] if item.get("idea_id") == hypothesis.hypothesis_id),
+                None,
+            )
+            if not fallback_item:
+                continue
+            ideas_payload.append(
+                {
+                    "idea_id": hypothesis.hypothesis_id,
+                    "idea_title": hypothesis.title,
+                    "search_terms": self._normalize_search_terms(fallback_item.get("search_terms") or []),
+                    "broader_terms": self._normalize_search_terms(fallback_item.get("broader_terms") or []),
+                    "rationale": str(fallback_item.get("rationale") or "").strip(),
+                }
+            )
+
+        shared_terms = self._normalize_search_terms(payload.get("shared_terms") or [])
+        shared_terms = dedupe_preserve_order(
+            shared_terms
+            + self._normalize_search_terms(payload.get("shared_broader_terms") or [])
+            + fallback.get("shared_terms", [])
+            + fallback.get("shared_broader_terms", [])
+            + research_goal.reference_seed_queries()
+            + [research_goal.description]
+            + research_plan.seed_queries
+        )
+        notes = coerce_string_list(payload.get("notes", [])) or fallback.get("notes", [])
+        return {
+            "ideas": ideas_payload,
+            "shared_terms": shared_terms[:16],
+            "shared_broader_terms": dedupe_preserve_order(self._normalize_search_terms(payload.get("shared_broader_terms") or []) + fallback.get("shared_broader_terms", []))[:16],
+            "notes": notes,
+        }
+
+    def _build_cycle_literature_queries(
+        self,
+        term_payload: Dict[str, Any],
+        hypotheses: Sequence[Hypothesis],
+        research_goal: ResearchGoal,
+        research_plan: ResearchPlan,
+        query_budget: int,
+    ) -> List[str]:
+        idea_payloads = term_payload.get("ideas", [])
+        payload_by_id = {
+            str(item.get("idea_id") or "").strip(): item
+            for item in idea_payloads
+            if isinstance(item, dict) and str(item.get("idea_id") or "").strip()
+        }
+
+        shared_terms = self._normalize_search_terms(
+            term_payload.get("shared_terms", [])
+            + term_payload.get("shared_broader_terms", [])
+            + research_plan.seed_queries
+            + research_goal.reference_seed_queries()
+            + [research_goal.description]
+        )
+
+        try:
+            per_idea_queries = int(config.get("cycle_literature_queries_per_idea", 2))
+        except (TypeError, ValueError):
+            per_idea_queries = 2
+        per_idea_queries = max(1, per_idea_queries)
+        query_chunks: List[List[str]] = []
+        idea_term_groups: List[List[str]] = []
+
+        for hypothesis in hypotheses:
+            payload = payload_by_id.get(hypothesis.hypothesis_id, {})
+            term_pool = self._normalize_search_terms(
+                list(payload.get("search_terms", []))
+                + list(payload.get("broader_terms", []))
+                + list(hypothesis.search_queries)
+                + [hypothesis.title, hypothesis.focus_area, hypothesis.primary_bottleneck]
+                + _focus_area_query_variants(hypothesis.focus_area)
+            )
+            if not term_pool:
+                continue
+            idea_term_groups.append(term_pool)
+            primary_terms = term_pool[:6] + shared_terms[:2]
+            if primary_terms:
+                query_chunks.append(primary_terms)
+            if per_idea_queries > 1:
+                secondary_terms = term_pool[6:12] + shared_terms[2:6]
+                if secondary_terms:
+                    query_chunks.append(secondary_terms)
+
+        if shared_terms:
+            query_chunks.append(shared_terms[:10])
+
+        if idea_term_groups:
+            balanced_terms = _round_robin_query_bundle(idea_term_groups + ([shared_terms] if shared_terms else []), limit=24)
+            if balanced_terms:
+                query_chunks.append(balanced_terms[:10])
+
+        query_chunks = [chunk for chunk in query_chunks if chunk]
+        queries = [self._or_query(chunk) for chunk in query_chunks]
+        queries = [query for query in dedupe_preserve_order(queries) if query]
+        return queries[:query_budget]
+
+    def _batch_literature_query_budget(self, research_goal: ResearchGoal, hypotheses: Sequence[Hypothesis]) -> int:
+        if not hypotheses:
+            return 0
+        default_per_idea = max(1, min(2, research_goal.prior_art_queries_per_idea))
+        try:
+            per_idea = int(config.get("cycle_literature_queries_per_idea", default_per_idea))
+        except (TypeError, ValueError):
+            per_idea = default_per_idea
+        try:
+            max_queries = int(config.get("cycle_literature_max_queries", 24))
+        except (TypeError, ValueError):
+            max_queries = 24
+        per_idea = max(1, per_idea)
+        max_queries = max(4, max_queries)
+        return min(max_queries, max(4, per_idea * len(hypotheses) + 2))
+
+    def _prefetch_literature_for_hypotheses(
+        self,
+        hypotheses: Sequence[Hypothesis],
+        research_goal: ResearchGoal,
+        context: ContextMemory,
+        step_name: str,
+    ) -> Dict[str, Any]:
+        candidates = [hypothesis for hypothesis in hypotheses if hypothesis.is_active]
+        research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
+        query_budget = self._batch_literature_query_budget(research_goal, candidates)
+        if query_budget <= 0:
+            return {
+                "status": "skipped",
+                "reason": "no_active_hypotheses",
+                "queries": [],
+                "query_budget": 0,
+                "results_per_query": research_goal.prior_art_results_per_query,
+                "local_corpus_size": len(self.literature_service.local_corpus()),
+            }
+
+        term_payload = self._plan_cycle_literature_terms(
+            research_goal,
+            research_plan,
+            candidates,
+            context,
+            step_name=step_name,
+            query_budget=query_budget,
+        )
+        planned_queries = self._build_cycle_literature_queries(
+            term_payload,
+            candidates,
+            research_goal,
+            research_plan,
+            query_budget,
+        )
+
+        try:
+            results_per_query = int(config.get("cycle_literature_results_per_query", max(100, research_goal.prior_art_results_per_query)))
+        except (TypeError, ValueError):
+            results_per_query = max(100, research_goal.prior_art_results_per_query)
+        results_per_query = max(100, results_per_query)
+
+        prefetch = self.literature_service.prefetch_corpus(
+            planned_queries,
+            results_per_query=results_per_query,
+        )
+        return {
+            "status": "prefetched",
+            "query_budget": query_budget,
+            "results_per_query": results_per_query,
+            "candidate_count": len(candidates),
+            "term_plan": term_payload,
+            **prefetch,
+        }
+
+    def _local_literature_corpus(self) -> List[Dict[str, Any]]:
+        return self.literature_service.local_corpus()
+
+    def _recall_local_literature(
+        self,
+        query_text: str,
+        max_results: int,
+        selection_reason: str,
+    ) -> List[Dict[str, Any]]:
+        if max_results <= 0:
+            return []
+        corpus_notes = self._local_literature_corpus()
+        if not corpus_notes:
+            return []
+
+        candidate_limit = max(max_results * 4, max_results)
+        try:
+            vector_results = get_prior_art_vector_index().search(
+                query_text,
+                corpus_notes,
+                top_k=candidate_limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Local literature vector recall failed; falling back to lexical recall: %s", exc)
+            vector_results = self._lexical_local_literature_recall(query_text, corpus_notes, candidate_limit)
+
+        recalled: List[Dict[str, Any]] = []
+        for result in vector_results:
+            note = result.get("note", {})
+            if not isinstance(note, dict):
+                continue
+            annotated = dict(note)
+            annotated["selection_reason"] = selection_reason
+            annotated["semantic_score"] = _round_score(float(result.get("semantic_score", 0.0)))
+            if result.get("vector_rank") is not None:
+                annotated["vector_rank"] = result.get("vector_rank")
+            if result.get("vector_index_backend"):
+                annotated["vector_index_backend"] = result.get("vector_index_backend")
+            recalled.append(annotated)
+        return dedupe_notes(recalled)[:max_results]
+
+    def _recall_local_literature_for_hypothesis(
+        self,
+        hypothesis: Hypothesis,
+        max_results: int,
+        selection_reason: str,
+    ) -> List[Dict[str, Any]]:
+        return self._recall_local_literature(
+            _hypothesis_recall_text(hypothesis),
+            max_results=max_results,
+            selection_reason=selection_reason,
+        )
+
+    def _lexical_local_literature_recall(
+        self,
+        query_text: str,
+        corpus_notes: Sequence[Dict[str, Any]],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        scored = []
+        for note in dedupe_notes(corpus_notes):
+            score = lexical_similarity_score(query_text, paper_recall_text(note))
+            if score <= 0:
+                continue
+            scored.append(
+                {
+                    "note": note,
+                    "semantic_score": score,
+                    "vector_rank": None,
+                    "vector_index_backend": "lexical_fallback",
+                }
+            )
+        scored.sort(key=lambda item: item.get("semantic_score", 0.0), reverse=True)
+        for rank, item in enumerate(scored, start=1):
+            item["vector_rank"] = rank
+        return scored[:top_k]
 
     def _literature_sample_seed(
         self,
@@ -1061,10 +1525,30 @@ class PriorArtAgent(LiteratureMixin):
             )
 
         candidates = [hypothesis for hypothesis in hypotheses if hypothesis.is_active]
+        prefetch_candidates = [
+            hypothesis
+            for hypothesis in candidates
+            if not (hypothesis.prior_art_signature == hypothesis.idea_signature() and hypothesis.prior_art_audit)
+        ]
+        batch_prefetch = self._prefetch_literature_for_hypotheses(
+            prefetch_candidates,
+            research_goal,
+            context,
+            step_name=step_name,
+        )
+        local_corpus_notes = self._local_literature_corpus()
+        batch_queries = coerce_string_list(batch_prefetch.get("queries", []))
 
         def check_one(hypothesis: Hypothesis) -> Tuple[Hypothesis, Dict[str, Any], str | None]:
             try:
-                return hypothesis, self._check_one(hypothesis, research_goal, context, step_name), None
+                return hypothesis, self._check_one(
+                    hypothesis,
+                    research_goal,
+                    context,
+                    step_name,
+                    local_corpus_notes,
+                    batch_queries,
+                ), None
             except Exception as exc:  # noqa: BLE001
                 return hypothesis, self._fallback_error_result(hypothesis, exc), f"{hypothesis.hypothesis_id}: {exc}"
 
@@ -1105,12 +1589,14 @@ class PriorArtAgent(LiteratureMixin):
                 "kept_count": kept_count,
                 "repaired_count": repaired_count,
                 "rejected_count": rejected_count,
-                "query_budget": research_goal.prior_art_queries_per_idea,
-                "results_per_query": research_goal.prior_art_results_per_query,
+                "query_budget": batch_prefetch.get("query_budget", 0),
+                "results_per_query": batch_prefetch.get("results_per_query", research_goal.prior_art_results_per_query),
                 "embedding_candidates": research_goal.prior_art_embedding_candidates,
-                "retrieval_mode": "vector_index_embedding",
+                "retrieval_mode": "batch_prefetch_local_vector_index_embedding",
                 "review_top_k": research_goal.prior_art_review_top_k,
                 "similarity_threshold": research_goal.prior_art_similarity_threshold,
+                "local_corpus_size": len(local_corpus_notes),
+                "batch_prefetch": batch_prefetch,
             },
             errors=errors,
             duration=time.time() - start_time,
@@ -1122,6 +1608,8 @@ class PriorArtAgent(LiteratureMixin):
         research_goal: ResearchGoal,
         context: ContextMemory,
         step_name: str,
+        local_corpus_notes: Sequence[Dict[str, Any]],
+        literature_queries: Sequence[str],
     ) -> Dict[str, Any]:
         current_signature = hypothesis.idea_signature()
         if hypothesis.prior_art_signature == current_signature and hypothesis.prior_art_audit:
@@ -1139,20 +1627,7 @@ class PriorArtAgent(LiteratureMixin):
         starting_repair_count = hypothesis.prior_art_repair_count
 
         while True:
-            raw_queries = self._build_queries(research_goal, research_plan, hypothesis)
-            literature_queries = self._plan_literature_queries(
-                research_goal,
-                research_plan,
-                raw_queries,
-                step_name=step_name,
-                query_budget=research_goal.prior_art_queries_per_idea,
-                context=context,
-                hypothesis=hypothesis,
-            )
-            corpus_notes = self.literature_service.search_corpus(
-                literature_queries,
-                results_per_query=research_goal.prior_art_results_per_query,
-            )
+            corpus_notes = list(local_corpus_notes)
             similar_papers = self._rank_prior_art(hypothesis, corpus_notes, research_goal)
             audit_papers = similar_papers[: research_goal.prior_art_review_top_k]
             top_score = float(audit_papers[0].get("recall_score", 0.0)) if audit_papers else 0.0
@@ -1312,22 +1787,7 @@ class PriorArtAgent(LiteratureMixin):
         return scored[:candidate_limit]
 
     def _idea_recall_text(self, hypothesis: Hypothesis) -> str:
-        abstract = hypothesis.text.strip()
-        if not abstract:
-            abstract = " ".join(
-                part
-                for part in [
-                    hypothesis.problem_framing,
-                    hypothesis.central_insight,
-                    hypothesis.mechanism,
-                    hypothesis.rationale,
-                ]
-                if str(part).strip()
-            )
-        return title_abstract_recall_text(
-            hypothesis.title,
-            abstract,
-        )
+        return _hypothesis_recall_text(hypothesis)
 
     def _paper_recall_text(self, note: Dict[str, Any]) -> str:
         return paper_recall_text(note)
@@ -1595,21 +2055,10 @@ class ReflectionAgent(LiteratureMixin):
             remaining_slots = max(0, research_goal.max_literature_results - len(seeded_notes))
             literature_notes = list(seeded_notes)
             if remaining_slots > 0:
-                query_budget = 1 if hypothesis.origin == "evolution" and seeded_notes else 3
-                raw_literature_queries = self._build_queries(research_goal, research_plan, hypothesis)
-                literature_queries = self._plan_literature_queries(
-                    research_goal,
-                    research_plan,
-                    raw_literature_queries,
-                    step_name=step_name,
-                    query_budget=query_budget,
-                    context=context,
-                    hypothesis=hypothesis,
-                )
-                searched_notes = self._search_literature(
-                    literature_queries,
+                searched_notes = self._recall_local_literature_for_hypothesis(
+                    hypothesis,
                     remaining_slots,
-                    sample_seed=self._literature_sample_seed(research_goal, step_name, context, hypothesis),
+                    selection_reason=f"{step_name}_local_embedding",
                 )
                 literature_notes = dedupe_notes(seeded_notes + searched_notes)[: research_goal.max_literature_results]
 
@@ -1621,7 +2070,7 @@ class ReflectionAgent(LiteratureMixin):
                         reference_paper=reference_paper,
                         hypothesis=hypothesis.to_dict(),
                         literature_notes=literature_notes,
-                        tournament_history=context.tournament_results + context.codex_rerank_history,
+                        tournament_history=context.tournament_results + context.opencode_rerank_history,
                         meta_feedback=meta_feedback,
                     ),
                     model=research_goal.critic_llm_model,
@@ -2387,14 +2836,14 @@ class RankingAgent:
         loser.elo_score += k_factor * (0 - expected_loser)
 
 
-class CodexRerankingAgent:
-    """Use Codex CLI search/reasoning to rerank the current top-four ideas."""
+class OpenCodeRerankingAgent:
+    """Use OpenCode CLI search/reasoning to rerank the current top-four ideas."""
 
     def rerank_top_hypotheses(
         self,
         research_goal: ResearchGoal,
         context: ContextMemory,
-        step_name: str = "codex_reranking",
+        step_name: str = "opencode_reranking",
         top_n: int = 4,
     ) -> StepResult:
         start_time = time.time()
@@ -2407,7 +2856,10 @@ class CodexRerankingAgent:
                 data={"status": "skipped", "reason": "fewer_than_two_active_hypotheses"},
                 duration=time.time() - start_time,
             )
-        if not bool(config.get("enable_codex_reranking", True)):
+        enabled = config.get("enable_opencode_reranking")
+        if enabled is None:
+            enabled = config.get("enable_codex_reranking", True)
+        if not bool(enabled):
             return StepResult(
                 name=step_name,
                 hypotheses=candidates,
@@ -2415,10 +2867,13 @@ class CodexRerankingAgent:
                 duration=time.time() - start_time,
             )
 
-        model = str(config.get("codex_rerank_model") or "gpt-5.4")
-        timeout = int(config.get("codex_rerank_timeout_seconds", 900) or 900)
+        timeout_value = config.get(
+            "opencode_rerank_timeout_seconds",
+            config.get("codex_rerank_timeout_seconds", 900),
+        )
+        timeout = int(timeout_value or 900)
         prompt = self._build_prompt(research_goal, context, candidates)
-        command = ["codex", "exec", "--yolo", "-m", model, prompt]
+        command = ["opencode", "run", "--dangerously-skip-permissions", prompt]
         errors: List[str] = []
         raw_stdout = ""
         raw_stderr = ""
@@ -2435,15 +2890,15 @@ class CodexRerankingAgent:
             raw_stdout = completed.stdout or ""
             raw_stderr = completed.stderr or ""
             if completed.returncode != 0:
-                errors.append(f"codex exec exited with {completed.returncode}: {(raw_stderr or raw_stdout)[:1200]}")
+                errors.append(f"opencode run exited with {completed.returncode}: {(raw_stderr or raw_stdout)[:1200]}")
             else:
                 payload = self._parse_json_payload(raw_stdout)
                 if not payload:
-                    errors.append("codex exec returned no parseable JSON payload.")
+                    errors.append("opencode run returned no parseable JSON payload.")
         except subprocess.TimeoutExpired as exc:
-            errors.append(f"codex exec timed out after {timeout}s: {exc}")
+            errors.append(f"opencode run timed out after {timeout}s: {exc}")
         except OSError as exc:
-            errors.append(f"could not run codex exec: {exc}")
+            errors.append(f"could not run opencode run: {exc}")
 
         normalized = self._normalize_payload(payload, candidates)
         if payload and normalized["ranking"]:
@@ -2456,12 +2911,11 @@ class CodexRerankingAgent:
             "iteration": context.iteration_number + 1,
             "step": step_name,
             "status": status,
-            "model": model,
             "ranking": normalized["ranking"],
             "evaluations": normalized["evaluations"],
             "overall_rationale": str(payload.get("overall_rationale") or "").strip() if isinstance(payload, dict) else "",
         }
-        context.codex_rerank_history.append(record)
+        context.opencode_rerank_history.append(record)
 
         ranked_candidates = sorted(candidates, key=lambda hypothesis: hypothesis.elo_score, reverse=True)
         return StepResult(
@@ -2469,7 +2923,7 @@ class CodexRerankingAgent:
             hypotheses=ranked_candidates,
             data={
                 **record,
-                "command": f"codex exec --yolo -m {model}",
+                "command": "opencode run --dangerously-skip-permissions",
                 "candidate_ids": [hypothesis.hypothesis_id for hypothesis in candidates],
                 "stdout_tail": raw_stdout[-2000:],
                 "stderr_tail": raw_stderr[-2000:],
@@ -2619,7 +3073,7 @@ class CodexRerankingAgent:
             }
             if item.get("summary") and not evaluation.get("summary"):
                 evaluation["summary"] = item["summary"]
-            hypothesis.codex_rerank_reviews.append(evaluation)
+            hypothesis.opencode_rerank_reviews.append(evaluation)
             hypothesis.review_comments = dedupe_preserve_order(
                 hypothesis.review_comments
                 + coerce_string_list(evaluation.get("weaknesses", []))
@@ -2628,7 +3082,7 @@ class CodexRerankingAgent:
             )
             if evaluation.get("summary"):
                 hypothesis.review_comments = dedupe_preserve_order(
-                    hypothesis.review_comments + [f"codex_reranking: {evaluation['summary']}"]
+                    hypothesis.review_comments + [f"opencode_reranking: {evaluation['summary']}"]
                 )
 
 
@@ -2981,21 +3435,23 @@ class MetaReviewAgent(LiteratureMixin):
             for note in hypothesis.literature_notes
         )[: research_goal.max_literature_results]
         remaining_slots = max(0, research_goal.max_literature_results - len(seeded_notes))
-        query_budget = 1 if seeded_notes else 3
-        raw_literature_queries = dedupe_preserve_order(research_plan.seed_queries + [research_goal.description])
-        literature_queries = self._plan_literature_queries(
-            research_goal,
-            research_plan,
-            raw_literature_queries,
-            step_name="meta_review",
-            query_budget=query_budget,
-            context=context,
-        ) if remaining_slots > 0 else []
+        literature_queries: List[str] = []
+        meta_recall_text = title_abstract_recall_text(
+            research_plan.objective or research_goal.description,
+            " ".join(
+                dedupe_preserve_order(
+                    list(research_plan.focus_areas)
+                    + list(research_plan.key_questions)
+                    + coerce_string_list(trajectory_state.get("frontier_focus_gaps", []))
+                    + coerce_string_list(trajectory_state.get("overexplored_areas", []))
+                )
+            ),
+        )
         searched_notes = (
-            self._search_literature(
-                literature_queries,
+            self._recall_local_literature(
+                meta_recall_text,
                 remaining_slots,
-                sample_seed=self._literature_sample_seed(research_goal, "meta_review", context),
+                selection_reason="meta_review_local_embedding",
             )
             if remaining_slots > 0
             else []
@@ -3010,7 +3466,7 @@ class MetaReviewAgent(LiteratureMixin):
                     research_plan=research_plan.to_dict(),
                     ranked_hypotheses=[hypothesis.compact_summary() for hypothesis in ranked],
                     recent_reviews=recent_reviews,
-                    tournament_history=context.tournament_results + context.codex_rerank_history,
+                    tournament_history=context.tournament_results + context.opencode_rerank_history,
                     proximity_summary={
                         "clusters": proximity_data.get("clusters", []),
                         "duplicate_candidates": proximity_data.get("duplicate_candidates", []),
