@@ -90,8 +90,6 @@ def _build_research_goal(args: argparse.Namespace, constraints: Dict[str, Any]) 
         top_k_hypotheses=args.top_k_hypotheses,
         max_literature_results=args.max_literature_results,
         enable_prior_art_check=False if args.disable_prior_art_check else None,
-        prior_art_queries_per_idea=args.prior_art_queries_per_idea,
-        prior_art_results_per_query=args.prior_art_results_per_query,
         prior_art_embedding_candidates=args.prior_art_embedding_candidates,
         prior_art_review_top_k=args.prior_art_review_top_k,
         prior_art_similarity_threshold=args.prior_art_similarity_threshold,
@@ -247,6 +245,15 @@ def run_cycles(args: argparse.Namespace) -> Dict[str, str]:
     constraints = _load_constraints(args.constraints)
     _require_llm_api_key()
     research_goal = _build_research_goal(args, constraints)
+    logger.info(
+        "Runtime memory controls: max_concurrency=%d sentence_transformer_device=%s "
+        "vector_batch_size=%s vector_backend=%s vector_search_chunk_size=%s",
+        research_goal.max_concurrency,
+        config.get("sentence_transformer_device") or "auto",
+        config.get("prior_art_vector_batch_size", 64),
+        config.get("prior_art_vector_index_backend", "auto"),
+        config.get("prior_art_vector_search_chunk_size", 20000),
+    )
     try:
         research_goal.reference_paper_context = prepare_reference_paper(
             args.reference_arxiv,
@@ -346,8 +353,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elo-k-factor", type=int, default=None, help="Elo K-factor for tournament ranking.")
     parser.add_argument("--max-literature-results", type=int, default=None, help="Maximum literature notes to attach per search bundle.")
     parser.add_argument("--disable-prior-art-check", action="store_true", help="Skip large-pool prior-art duplicate checking.")
-    parser.add_argument("--prior-art-queries-per-idea", type=int, default=None, help="Maximum prior-art search queries planned for each idea.")
-    parser.add_argument("--prior-art-results-per-query", type=int, default=None, help="Large-pool papers retrieved per prior-art query.")
     parser.add_argument("--prior-art-embedding-candidates", type=int, default=None, help="Embedding/vector recall candidates scored before LLM prior-art audit.")
     parser.add_argument("--prior-art-review-top-k", type=int, default=None, help="Top recalled prior-art papers sent to LLM audit.")
     parser.add_argument("--prior-art-similarity-threshold", type=float, default=None, help="Minimum recall score before LLM duplicate audit.")

@@ -153,8 +153,6 @@ class ResearchGoal:
     top_k_hypotheses: Optional[int] = None
     max_literature_results: Optional[int] = None
     enable_prior_art_check: Optional[bool] = None
-    prior_art_queries_per_idea: Optional[int] = None
-    prior_art_results_per_query: Optional[int] = None
     prior_art_embedding_candidates: Optional[int] = None
     prior_art_review_top_k: Optional[int] = None
     prior_art_similarity_threshold: Optional[float] = None
@@ -219,18 +217,6 @@ class ResearchGoal:
             self.enable_prior_art_check = bool(config.get("enable_prior_art_check", True))
         else:
             self.enable_prior_art_check = bool(self.enable_prior_art_check)
-        self.prior_art_queries_per_idea = _bounded_int(
-            self.prior_art_queries_per_idea
-            if self.prior_art_queries_per_idea is not None
-            else config.get("prior_art_queries_per_idea", 6),
-            default=6,
-        )
-        self.prior_art_results_per_query = _bounded_int(
-            self.prior_art_results_per_query
-            if self.prior_art_results_per_query is not None
-            else config.get("prior_art_results_per_query", 50),
-            default=50,
-        )
         self.prior_art_embedding_candidates = _bounded_int(
             self.prior_art_embedding_candidates
             if self.prior_art_embedding_candidates is not None
@@ -305,8 +291,6 @@ class ResearchGoal:
                 str(self.top_k_hypotheses),
                 str(self.max_literature_results),
                 str(self.enable_prior_art_check),
-                str(self.prior_art_queries_per_idea),
-                str(self.prior_art_results_per_query),
                 str(self.prior_art_embedding_candidates),
                 str(self.prior_art_review_top_k),
                 str(self.prior_art_similarity_threshold),
@@ -1004,8 +988,6 @@ class ResearchGoalRequest(BaseModel):
     top_k_hypotheses: Optional[int] = None
     max_literature_results: Optional[int] = None
     enable_prior_art_check: Optional[bool] = None
-    prior_art_queries_per_idea: Optional[int] = None
-    prior_art_results_per_query: Optional[int] = None
     prior_art_embedding_candidates: Optional[int] = None
     prior_art_review_top_k: Optional[int] = None
     prior_art_similarity_threshold: Optional[float] = None

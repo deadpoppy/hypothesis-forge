@@ -429,8 +429,8 @@ class LiteratureSearchService:
         use_exact_cache: bool,
     ) -> List[Dict[str, Any]]:
         cached = self.cache.get(source, query)
-        if use_exact_cache and cached:
-            return cached
+        if use_exact_cache and len(cached) >= max_results:
+            return cached[:max_results]
 
         if source == "semantic_scholar":
             if hasattr(self.semantic_scholar_tool, "search_papers_bulk"):
@@ -439,15 +439,17 @@ class LiteratureSearchService:
                 papers = self.semantic_scholar_tool.search_papers(query, max_results=max_results)
             notes = [self._semantic_scholar_note(paper) for paper in papers]
             if notes:
-                self.cache.set(source, query, notes)
-                return notes
+                merged = dedupe_notes(cached + notes)
+                self.cache.set(source, query, merged)
+                return merged
             return cached
 
         papers = self.arxiv_tool.search_papers(query=query, max_results=max_results, sort_by="relevance")
         notes = [self._arxiv_note(paper) for paper in papers]
         if notes:
-            self.cache.set(source, query, notes)
-            return notes
+            merged = dedupe_notes(cached + notes)
+            self.cache.set(source, query, merged)
+            return merged
         return cached
 
     def _semantic_scholar_note(self, paper: Dict[str, Any]) -> Dict[str, Any]:

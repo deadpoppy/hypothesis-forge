@@ -172,8 +172,6 @@ def get_sentence_transformer_model(model_name: str | None = None, local_files_on
         if cached_model is False:
             raise RuntimeError(f"Sentence transformer model is unavailable: {resolved_model_name}")
         if cached_model is None:
-            from sentence_transformers import SentenceTransformer
-
             logger.info(
                 "Loading sentence transformer model: %s (local_files_only=%s, device=%s)",
                 resolved_model_name,
@@ -181,6 +179,8 @@ def get_sentence_transformer_model(model_name: str | None = None, local_files_on
                 resolved_device or "auto",
             )
             try:
+                from sentence_transformers import SentenceTransformer
+
                 kwargs = {"local_files_only": resolved_local_files_only}
                 if resolved_device:
                     kwargs["device"] = resolved_device

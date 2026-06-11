@@ -893,7 +893,6 @@ class LiteratureMixin:
         hypotheses: Sequence[Hypothesis],
         context: ContextMemory,
         step_name: str,
-        query_budget: int,
     ) -> Dict[str, Any]:
         fallback = self._build_default_cycle_literature_term_payload(research_goal, research_plan, hypotheses)
         if not hypotheses:
@@ -926,7 +925,6 @@ class LiteratureMixin:
                         search_context=search_context,
                         max_terms_per_idea=max_terms_per_idea,
                         max_shared_terms=max_shared_terms,
-                        max_queries=query_budget,
                     ),
                     model=research_goal.llm_model,
                     temperature=0.1,
@@ -981,31 +979,23 @@ class LiteratureMixin:
             )
 
         shared_terms = self._normalize_search_terms(payload.get("shared_terms") or [])
-        shared_terms = dedupe_preserve_order(
-            shared_terms
-            + self._normalize_search_terms(payload.get("shared_broader_terms") or [])
-            + fallback.get("shared_terms", [])
-            + fallback.get("shared_broader_terms", [])
-            + research_goal.reference_seed_queries()
-            + [research_goal.description]
-            + research_plan.seed_queries
-        )
+        shared_broader_terms = self._normalize_search_terms(payload.get("shared_broader_terms") or [])
+        if not shared_terms and not shared_broader_terms:
+            shared_terms = self._normalize_search_terms(fallback.get("shared_terms", []))
+            shared_broader_terms = self._normalize_search_terms(fallback.get("shared_broader_terms", []))
         notes = coerce_string_list(payload.get("notes", [])) or fallback.get("notes", [])
         return {
             "ideas": ideas_payload,
-            "shared_terms": shared_terms[:16],
-            "shared_broader_terms": dedupe_preserve_order(self._normalize_search_terms(payload.get("shared_broader_terms") or []) + fallback.get("shared_broader_terms", []))[:16],
+            "shared_terms": shared_terms,
+            "shared_broader_terms": shared_broader_terms,
             "notes": notes,
         }
 
-    def _build_cycle_literature_queries(
+    def _build_cycle_literature_query(
         self,
         term_payload: Dict[str, Any],
         hypotheses: Sequence[Hypothesis],
-        research_goal: ResearchGoal,
-        research_plan: ResearchPlan,
-        query_budget: int,
-    ) -> List[str]:
+    ) -> str:
         idea_payloads = term_payload.get("ideas", [])
         payload_by_id = {
             str(item.get("idea_id") or "").strip(): item
@@ -1013,82 +1003,29 @@ class LiteratureMixin:
             if isinstance(item, dict) and str(item.get("idea_id") or "").strip()
         }
 
-        shared_terms = self._normalize_search_terms(
-            term_payload.get("shared_terms", [])
-            + term_payload.get("shared_broader_terms", [])
-            + research_plan.seed_queries
-            + research_goal.reference_seed_queries()
-            + [research_goal.description]
-        )
-
-        try:
-            per_idea_queries = int(config.get("cycle_literature_queries_per_idea", 2))
-        except (TypeError, ValueError):
-            per_idea_queries = 2
-        per_idea_queries = max(1, per_idea_queries)
-        query_chunks: List[List[str]] = []
-        idea_term_groups: List[List[str]] = []
-
+        combined_terms: List[str] = []
         for hypothesis in hypotheses:
             payload = payload_by_id.get(hypothesis.hypothesis_id, {})
-            term_pool = self._normalize_search_terms(
-                list(payload.get("search_terms", []))
-                + list(payload.get("broader_terms", []))
-                + list(hypothesis.search_queries)
-                + [hypothesis.title, hypothesis.focus_area, hypothesis.primary_bottleneck]
-                + _focus_area_query_variants(hypothesis.focus_area)
+            combined_terms.extend(
+                self._normalize_search_terms(
+                    list(payload.get("search_terms", []))
+                    + list(payload.get("broader_terms", []))
+                )
             )
-            if not term_pool:
-                continue
-            idea_term_groups.append(term_pool)
-            primary_terms = term_pool[:6] + shared_terms[:2]
-            if primary_terms:
-                query_chunks.append(primary_terms)
-            if per_idea_queries > 1:
-                secondary_terms = term_pool[6:12] + shared_terms[2:6]
-                if secondary_terms:
-                    query_chunks.append(secondary_terms)
+        combined_terms.extend(
+            self._normalize_search_terms(
+                list(term_payload.get("shared_terms", []))
+                + list(term_payload.get("shared_broader_terms", []))
+            )
+        )
+        return self._or_query(combined_terms)
 
-        if shared_terms:
-            query_chunks.append(shared_terms[:10])
-
-        if idea_term_groups:
-            balanced_terms = _round_robin_query_bundle(idea_term_groups + ([shared_terms] if shared_terms else []), limit=24)
-            if balanced_terms:
-                query_chunks.append(balanced_terms[:10])
-
+    def _cycle_literature_result_limit(self) -> int:
         try:
-            terms_per_query = int(config.get("literature_or_terms_per_query", 4))
+            value = int(config.get("cycle_literature_results_per_query", 1000))
         except (TypeError, ValueError):
-            terms_per_query = 4
-        terms_per_query = max(2, min(8, terms_per_query))
-
-        queries = []
-        for chunk in query_chunks:
-            normalized_chunk = self._normalize_search_terms(chunk)
-            for index in range(0, len(normalized_chunk), terms_per_query):
-                query = self._or_query(normalized_chunk[index : index + terms_per_query])
-                if query:
-                    queries.append(query)
-                if len(queries) >= query_budget:
-                    return dedupe_preserve_order(queries)[:query_budget]
-        return dedupe_preserve_order(queries)[:query_budget]
-
-    def _batch_literature_query_budget(self, research_goal: ResearchGoal, hypotheses: Sequence[Hypothesis]) -> int:
-        if not hypotheses:
-            return 0
-        default_per_idea = max(1, min(2, research_goal.prior_art_queries_per_idea))
-        try:
-            per_idea = int(config.get("cycle_literature_queries_per_idea", default_per_idea))
-        except (TypeError, ValueError):
-            per_idea = default_per_idea
-        try:
-            max_queries = int(config.get("cycle_literature_max_queries", 24))
-        except (TypeError, ValueError):
-            max_queries = 24
-        per_idea = max(1, per_idea)
-        max_queries = max(4, max_queries)
-        return min(max_queries, max(4, per_idea * len(hypotheses) + 2))
+            value = 1000
+        return max(1000, value)
 
     def _prefetch_literature_for_hypotheses(
         self,
@@ -1099,14 +1036,14 @@ class LiteratureMixin:
     ) -> Dict[str, Any]:
         candidates = [hypothesis for hypothesis in hypotheses if hypothesis.is_active]
         research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
-        query_budget = self._batch_literature_query_budget(research_goal, candidates)
-        if query_budget <= 0:
+        results_per_query = self._cycle_literature_result_limit()
+        if not candidates:
             return {
                 "status": "skipped",
                 "reason": "no_active_hypotheses",
+                "query": "",
                 "queries": [],
-                "query_budget": 0,
-                "results_per_query": research_goal.prior_art_results_per_query,
+                "results_per_query": results_per_query,
                 "local_corpus_size": len(self.literature_service.local_corpus()),
             }
 
@@ -1116,21 +1053,12 @@ class LiteratureMixin:
             candidates,
             context,
             step_name=step_name,
-            query_budget=query_budget,
         )
-        planned_queries = self._build_cycle_literature_queries(
+        planned_query = self._build_cycle_literature_query(
             term_payload,
             candidates,
-            research_goal,
-            research_plan,
-            query_budget,
         )
-
-        try:
-            results_per_query = int(config.get("cycle_literature_results_per_query", max(100, research_goal.prior_art_results_per_query)))
-        except (TypeError, ValueError):
-            results_per_query = max(100, research_goal.prior_art_results_per_query)
-        results_per_query = max(100, results_per_query)
+        planned_queries = [planned_query] if planned_query else []
 
         prefetch = self.literature_service.prefetch_corpus(
             planned_queries,
@@ -1138,7 +1066,7 @@ class LiteratureMixin:
         )
         return {
             "status": "prefetched",
-            "query_budget": query_budget,
+            "query": planned_query,
             "results_per_query": results_per_query,
             "candidate_count": len(candidates),
             "term_plan": term_payload,
@@ -1618,8 +1546,8 @@ class PriorArtAgent(LiteratureMixin):
                 "kept_count": kept_count,
                 "repaired_count": repaired_count,
                 "rejected_count": rejected_count,
-                "query_budget": batch_prefetch.get("query_budget", 0),
-                "results_per_query": batch_prefetch.get("results_per_query", research_goal.prior_art_results_per_query),
+                "query_count": batch_prefetch.get("query_count", 0),
+                "results_per_query": batch_prefetch.get("results_per_query", self._cycle_literature_result_limit()),
                 "embedding_candidates": research_goal.prior_art_embedding_candidates,
                 "retrieval_mode": "batch_prefetch_local_vector_index_embedding",
                 "review_top_k": research_goal.prior_art_review_top_k,

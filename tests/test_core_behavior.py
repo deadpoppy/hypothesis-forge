@@ -1377,12 +1377,10 @@ critic_llm:
         self.assertEqual(result.data["audits"]["H1"]["status"], "skipped_unchanged")
         self.assertEqual(mocked_prefetch.call_count, 0)
 
-    def test_prior_art_batch_prefetches_all_active_ideas_once(self):
+    def test_prior_art_prefetches_one_complete_query_for_all_active_ideas(self):
         goal = ResearchGoal(
             "goal",
             enable_prior_art_check=True,
-            prior_art_queries_per_idea=2,
-            prior_art_results_per_query=3,
             prior_art_embedding_candidates=1,
             prior_art_review_top_k=1,
             prior_art_similarity_threshold=0.5,
@@ -1466,14 +1464,19 @@ critic_llm:
 
         self.assertEqual(mocked_call.call_count, 1)
         self.assertEqual(mocked_prefetch.call_count, 1)
-        self.assertGreaterEqual(captured_queries["results_per_query"], 100)
+        self.assertGreaterEqual(captured_queries["results_per_query"], 1000)
         self.assertEqual(mocked_local.call_count, 1)
-        self.assertGreaterEqual(len(captured_queries["queries"]), 4)
-        self.assertTrue(all(" OR " in query for query in captured_queries["queries"]))
-        self.assertTrue(any("end-to-end model" in query and "autonomous driving model" in query for query in captured_queries["queries"]))
-        self.assertTrue(any("verification overhead" in query and "fused kernel" in query for query in captured_queries["queries"]))
+        self.assertEqual(len(captured_queries["queries"]), 1)
+        combined_query = captured_queries["queries"][0]
+        self.assertIn(" OR ", combined_query)
+        self.assertIn("end-to-end model", combined_query)
+        self.assertIn("autonomous driving model", combined_query)
+        self.assertIn("verification overhead", combined_query)
+        self.assertIn("fused kernel", combined_query)
         self.assertEqual(result.data["checked_count"], 2)
-        self.assertGreaterEqual(result.data["batch_prefetch"]["query_count"], 4)
+        self.assertEqual(result.data["query_count"], 1)
+        self.assertEqual(result.data["batch_prefetch"]["query_count"], 1)
+        self.assertEqual(result.data["batch_prefetch"]["query"], combined_query)
         self.assertEqual(result.data["retrieval_mode"], "batch_prefetch_local_vector_index_embedding")
 
     def test_paper_vector_index_persists_and_ranks_by_embedding(self):
@@ -1694,8 +1697,6 @@ critic_llm:
             llm_model="thinking-model",
             critic_llm_model="critic-model",
             enable_prior_art_check=True,
-            prior_art_queries_per_idea=1,
-            prior_art_results_per_query=1,
             prior_art_embedding_candidates=1,
             prior_art_review_top_k=1,
             prior_art_similarity_threshold=0.5,
@@ -1755,7 +1756,6 @@ critic_llm:
             "_prefetch_literature_for_hypotheses",
             return_value={
                 "queries": ["duplicate query"],
-                "query_budget": 1,
                 "results_per_query": 1,
                 "query_count": 1,
                 "fetched_count": 1,
@@ -2398,6 +2398,70 @@ critic_llm:
         self.assertEqual(first[0]["sources"], ["arxiv", "semantic_scholar"])
         self.assertEqual(first[0]["citation_count"], 17)
         self.assertGreaterEqual(len(second), 1)
+
+    def test_prefetch_expands_partial_exact_query_cache_to_requested_size(self):
+        query = '"end-to-end model" OR "autonomous driving model"'
+        cached_paper = {
+            "source": "arxiv",
+            "arxiv_id": "2501.00001v1",
+            "title": "Cached Paper",
+            "abstract": "cached",
+        }
+
+        class FakeArxiv:
+            def __init__(self):
+                self.calls = 0
+
+            def search_papers(self, query, max_results=None, categories=None, sort_by="relevance"):
+                self.calls += 1
+                self.query = query
+                self.max_results = max_results
+                return [
+                    {
+                        "title": "New Paper A",
+                        "abstract": "new a",
+                        "authors": [],
+                        "published": "2026-01-01T00:00:00",
+                        "arxiv_id": "2601.00002v1",
+                        "arxiv_url": "https://arxiv.org/abs/2601.00002",
+                        "pdf_url": "https://arxiv.org/pdf/2601.00002",
+                    },
+                    {
+                        "title": "New Paper B",
+                        "abstract": "new b",
+                        "authors": [],
+                        "published": "2026-01-02T00:00:00",
+                        "arxiv_id": "2601.00003v1",
+                        "arxiv_url": "https://arxiv.org/abs/2601.00003",
+                        "pdf_url": "https://arxiv.org/pdf/2601.00003",
+                    },
+                    {
+                        "title": "New Paper C",
+                        "abstract": "new c",
+                        "authors": [],
+                        "published": "2026-01-03T00:00:00",
+                        "arxiv_id": "2601.00004v1",
+                        "arxiv_url": "https://arxiv.org/abs/2601.00004",
+                        "pdf_url": "https://arxiv.org/pdf/2601.00004",
+                    },
+                ]
+
+        with TemporaryDirectory() as temp_dir:
+            service = LiteratureSearchService()
+            service.cache = LiteratureCache(f"{temp_dir}/literature_cache.json")
+            service.sources = {"arxiv"}
+            service.arxiv_tool = FakeArxiv()
+            service.cache.set("arxiv", query, [cached_paper])
+
+            result = service.prefetch_corpus([query], results_per_query=3)
+            expanded_cache = service.cache.get("arxiv", query)
+
+        self.assertEqual(service.arxiv_tool.calls, 1)
+        self.assertEqual(service.arxiv_tool.query, query)
+        self.assertEqual(service.arxiv_tool.max_results, 3)
+        self.assertEqual(len(expanded_cache), 4)
+        self.assertEqual(result["query_count"], 1)
+        self.assertEqual(result["fetched_count"], 4)
 
     def test_extract_hypothesis_items_accepts_common_top_level_list_keys(self):
         payload = {

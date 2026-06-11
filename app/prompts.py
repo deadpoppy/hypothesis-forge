@@ -252,12 +252,11 @@ def build_cycle_literature_query_planning_messages(
     search_context: Dict[str, Any],
     max_terms_per_idea: int,
     max_shared_terms: int,
-    max_queries: int,
 ) -> List[Dict[str, str]]:
     prompt = f"""
 Plan a high-recall literature sweep for the full cycle at once.
-Read every idea together and extract search vocabulary that should retrieve relevant papers.
-The downstream system will combine terms with OR and run a small number of broad searches.
+Read every idea together and extract discriminative search vocabulary that retrieves relevant papers.
+The downstream system will deduplicate every returned phrase and combine all of them into exactly one complete OR query.
 Do not plan single-query searches one idea at a time.
 
 Research goal:
@@ -273,17 +272,18 @@ Search context:
 {_json_block(search_context)}
 
 Search budget:
-- At most {max_queries} broad OR queries in total.
+- Exactly one complete OR query will be sent to each literature source.
 - Prefer {max_terms_per_idea} or fewer search terms per idea.
 - Prefer up to {max_shared_terms} shared terms for the whole cycle.
 
 Guidelines:
-- Return short search phrases, task names, method names, dataset names, and mechanism vocabulary.
+- Return differential short phrases, task names, method names, dataset names, and mechanism vocabulary.
+- Prefer terms that distinguish each idea from the other ideas in this cycle.
 - Think like an academic search expert: maximize recall, not elegance.
 - Use vocabulary that would appear in titles and abstracts.
 - Some terms may be shared across multiple ideas.
 - Avoid duplicate or near-duplicate terms.
-- Do not emit full boolean queries; the code will combine the terms with OR.
+- Do not emit full boolean queries or split the terms into separate queries; the code will build the single OR query.
 - No markdown, no explanation outside the JSON schema.
 
 Required JSON schema:

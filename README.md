@@ -107,9 +107,9 @@ sentence_transformer_enabled: true
 sentence_transformer_model: "BAAI/bge-small-en-v1.5"
 sentence_transformer_local_files_only: false
 prior_art_include_cache_corpus: true
-cycle_literature_queries_per_idea: 2
-cycle_literature_max_queries: 24
-cycle_literature_results_per_query: 100
+cycle_literature_terms_per_idea: 6
+cycle_literature_shared_terms: 12
+cycle_literature_results_per_query: 1000
 literature_or_terms_per_query: 4
 prior_art_embedding_candidates: 200
 prior_art_vector_index_path: ".cache/prior_art_vector_index.npz"
@@ -117,7 +117,7 @@ prior_art_vector_index_backend: "auto"
 prior_art_query_prefix: ""
 ```
 
-Prior-art recall now batch-plans search terms for the whole cycle's idea set, bundles them into a small number of OR queries, writes the resulting papers into the cache, and then reuses the local literature cache as the embedding corpus for per-idea checks. Other online literature grounding also bundles plain candidate terms before calling the paper sources. Query and paper embeddings use a compact `Title:` + `Abstract:` text format. The `auto` backend uses FAISS when it is installed and falls back to chunked numpy search otherwise. Keep `sentence_transformer_local_files_only: true` only after the configured embedding model is already cached locally.
+Prior-art recall now plans differential search terms for the whole cycle's idea set, deduplicates all terms into one complete OR query, sends that query once to each paper source with a default limit of 1000 papers per source, writes every returned paper into the cache, and then reuses the local literature cache as the embedding corpus for per-idea checks. Other online literature grounding also bundles plain candidate terms before calling the paper sources. Query and paper embeddings use a compact `Title:` + `Abstract:` text format. The `auto` backend uses FAISS when it is installed and falls back to chunked numpy search otherwise. Keep `sentence_transformer_local_files_only: true` only after the configured embedding model is already cached locally.
 
 ## Quick Start
 
