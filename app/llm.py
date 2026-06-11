@@ -321,23 +321,61 @@ def _strip_code_fence(text: str) -> str:
     return cleaned.strip()
 
 
-def extract_json_payload(raw_text: str) -> Any:
+def _json_response_sections(raw_text: str) -> List[str]:
     cleaned = _strip_code_fence(raw_text)
+    sections = []
+    think_end = cleaned.lower().rfind("</think>")
+    if think_end >= 0:
+        final_answer = _strip_code_fence(cleaned[think_end + len("</think>") :])
+        if final_answer:
+            sections.append(final_answer)
+    if cleaned and cleaned not in sections:
+        sections.append(cleaned)
+    return sections
+
+
+def extract_json_payload(
+    raw_text: str,
+    expected_type: type | tuple[type, ...] | None = None,
+) -> Any:
     decoder = json.JSONDecoder()
+    first_payload = None
+    found_payload = False
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    for index, character in enumerate(cleaned):
-        if character not in "[{":
-            continue
+    for cleaned in _json_response_sections(raw_text):
         try:
-            payload, _ = decoder.raw_decode(cleaned[index:])
-            return payload
+            payload = json.loads(cleaned)
+            if expected_type is None or isinstance(payload, expected_type):
+                return payload
+            if not found_payload:
+                first_payload = payload
+                found_payload = True
         except json.JSONDecodeError:
-            continue
+            pass
+
+        for index, character in enumerate(cleaned):
+            if character not in "[{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(cleaned[index:])
+            except json.JSONDecodeError:
+                continue
+            if expected_type is None or isinstance(payload, expected_type):
+                return payload
+            if not found_payload:
+                first_payload = payload
+                found_payload = True
+
+    if expected_type is not None and found_payload:
+        expected_name = (
+            " or ".join(candidate.__name__ for candidate in expected_type)
+            if isinstance(expected_type, tuple)
+            else expected_type.__name__
+        )
+        raise LLMCallError(
+            f"No valid JSON {expected_name} found in model response; "
+            f"the first JSON payload was {type(first_payload).__name__}."
+        )
 
     raise LLMCallError("No valid JSON payload found in model response.")
 
@@ -410,6 +448,7 @@ def call_json(
     model: str | None = None,
     temperature: float = 0.7,
     profile: str | None = None,
+    expected_type: type | tuple[type, ...] | None = None,
 ) -> Any:
     response = call_llm(messages=messages, model=model, temperature=temperature, profile=profile)
-    return extract_json_payload(response)
+    return extract_json_payload(response, expected_type=expected_type)

@@ -36,7 +36,7 @@ from app.agents import (
 from app.literature import LiteratureCache, LiteratureSearchService, dedupe_notes
 import app.llm as llm_module
 import app.reference as reference_module
-from app.llm import call_llm
+from app.llm import LLMCallError, call_llm, extract_json_payload
 from app.models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan
 from app.prompts import _serialize_literature, build_evolution_messages, build_generation_messages, build_meta_review_messages
 from app.reference import ReferencePaperError, normalize_arxiv_reference
@@ -64,6 +64,28 @@ class CoreBehaviorTests(unittest.TestCase):
         sentence_model_patch = patch("app.utils.get_sentence_transformer_model", side_effect=RuntimeError("offline"))
         sentence_model_patch.start()
         self.addCleanup(sentence_model_patch.stop)
+
+    def test_json_parser_prefers_final_answer_after_thinking(self):
+        payload = extract_json_payload(
+            '<think>Candidate fields: ["title", "concise_summary"]</think>\n'
+            '```json\n{"title": "Fast-WAM", "concise_summary": "Summary"}\n```',
+            expected_type=dict,
+        )
+
+        self.assertEqual(payload["title"], "Fast-WAM")
+
+    def test_json_parser_skips_wrong_top_level_type_when_object_expected(self):
+        payload = extract_json_payload(
+            'Candidate fields: ["title", "concise_summary"]\n'
+            'Final answer: {"title": "Fast-WAM", "concise_summary": "Summary"}',
+            expected_type=dict,
+        )
+
+        self.assertEqual(payload["concise_summary"], "Summary")
+
+    def test_json_parser_reports_wrong_payload_type(self):
+        with self.assertRaisesRegex(LLMCallError, "first JSON payload was list"):
+            extract_json_payload('["not", "an", "object"]', expected_type=dict)
 
     def test_cli_missing_constraints_reports_clear_input_error(self):
         result = subprocess.run(

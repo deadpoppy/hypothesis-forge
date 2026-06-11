@@ -134,6 +134,7 @@ def _summarize_reference_markdown(
             model=model,
             temperature=temperature,
             profile="thinking",
+            expected_type=dict,
         )
     except LLMCallError as exc:
         raise ReferencePaperError(f"Failed to summarize reference paper {arxiv_id}: {exc}") from exc
