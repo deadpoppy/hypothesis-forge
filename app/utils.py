@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
@@ -148,7 +149,8 @@ def generate_visjs_data(adjacency_graph: Dict[str, List[Dict[str, float]]], thre
     return {"nodes": nodes, "edges": edges}
 
 
-_sentence_transformer_models: Dict[tuple[str, bool], Any] = {}
+_sentence_transformer_models: Dict[tuple[str, bool, str], Any] = {}
+_sentence_transformer_models_lock = threading.RLock()
 _similarity_warning_emitted = False
 
 
@@ -162,28 +164,32 @@ def get_sentence_transformer_model(model_name: str | None = None, local_files_on
         if local_files_only is not None
         else bool(config.get("sentence_transformer_local_files_only", True))
     )
-    cache_key = (resolved_model_name, resolved_local_files_only)
-    cached_model = _sentence_transformer_models.get(cache_key)
-    if cached_model is False:
-        raise RuntimeError(f"Sentence transformer model is unavailable: {resolved_model_name}")
-    if cached_model is None:
-        from sentence_transformers import SentenceTransformer
+    configured_device = config.get("sentence_transformer_device")
+    resolved_device = str(configured_device).strip() if configured_device else ""
+    cache_key = (resolved_model_name, resolved_local_files_only, resolved_device)
+    with _sentence_transformer_models_lock:
+        cached_model = _sentence_transformer_models.get(cache_key)
+        if cached_model is False:
+            raise RuntimeError(f"Sentence transformer model is unavailable: {resolved_model_name}")
+        if cached_model is None:
+            from sentence_transformers import SentenceTransformer
 
-        logger.info(
-            "Loading sentence transformer model: %s (local_files_only=%s)",
-            resolved_model_name,
-            resolved_local_files_only,
-        )
-        try:
-            cached_model = SentenceTransformer(
+            logger.info(
+                "Loading sentence transformer model: %s (local_files_only=%s, device=%s)",
                 resolved_model_name,
-                local_files_only=resolved_local_files_only,
+                resolved_local_files_only,
+                resolved_device or "auto",
             )
-        except Exception as exc:  # noqa: BLE001
-            _sentence_transformer_models[cache_key] = False
-            raise RuntimeError(f"Sentence transformer load failed: {exc}") from exc
-        _sentence_transformer_models[cache_key] = cached_model
-    return cached_model
+            try:
+                kwargs = {"local_files_only": resolved_local_files_only}
+                if resolved_device:
+                    kwargs["device"] = resolved_device
+                cached_model = SentenceTransformer(resolved_model_name, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                _sentence_transformer_models[cache_key] = False
+                raise RuntimeError(f"Sentence transformer load failed: {exc}") from exc
+            _sentence_transformer_models[cache_key] = cached_model
+        return cached_model
 
 
 def lexical_similarity_score(text_a: str, text_b: str) -> float:

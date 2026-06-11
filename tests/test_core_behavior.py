@@ -6,6 +6,7 @@ import subprocess
 import sys
 import unittest
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -1512,6 +1513,116 @@ critic_llm:
         self.assertEqual(results[0]["vector_index_backend"], "numpy")
         self.assertTrue(index_exists)
 
+    def test_paper_vector_index_builds_once_under_concurrent_searches(self):
+        class FakeEmbeddingModel:
+            def __init__(self):
+                self.calls = []
+
+            def encode(self, texts, **_kwargs):
+                values = list(texts)
+                self.calls.append(values)
+                return [
+                    [1.0, 0.0] if "beta" in text.casefold() else [0.0, 1.0]
+                    for text in values
+                ]
+
+        notes = [
+            {"source": "arxiv", "arxiv_id": "1", "title": "Alpha Compression"},
+            {"source": "arxiv", "arxiv_id": "2", "title": "Beta Retrieval"},
+        ]
+        model = FakeEmbeddingModel()
+        with TemporaryDirectory() as temp_dir, patch(
+            "app.vector_index.get_sentence_transformer_model",
+            return_value=model,
+        ):
+            index = PaperVectorIndex(
+                index_path=Path(temp_dir) / "prior_art_index.npz",
+                model_name="fake-model",
+                backend="numpy",
+                query_prefix="",
+                document_prefix="",
+            )
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(lambda _: index.search("beta query", notes, top_k=1), range(4)))
+
+        corpus_builds = [call for call in model.calls if len(call) == len(notes)]
+        self.assertEqual(len(corpus_builds), 1)
+        self.assertTrue(all(result[0]["note"]["title"] == "Beta Retrieval" for result in results))
+
+    def test_paper_vector_index_incrementally_encodes_only_new_or_changed_papers(self):
+        class FakeEmbeddingModel:
+            def __init__(self):
+                self.calls = []
+
+            def encode(self, texts, **_kwargs):
+                values = list(texts)
+                self.calls.append(values)
+                vectors = []
+                for text in values:
+                    normalized = text.casefold()
+                    if "gamma" in normalized:
+                        vectors.append([1.0, 0.0, 0.0])
+                    elif "revised" in normalized:
+                        vectors.append([0.0, 1.0, 0.0])
+                    else:
+                        vectors.append([0.0, 0.0, 1.0])
+                return vectors
+
+        initial_notes = [
+            {"source": "arxiv", "arxiv_id": "1", "title": "Alpha", "abstract": "Original"},
+            {"source": "arxiv", "arxiv_id": "2", "title": "Beta", "abstract": "Original"},
+        ]
+        appended_notes = initial_notes + [
+            {"source": "arxiv", "arxiv_id": "3", "title": "Gamma", "abstract": "New paper"},
+        ]
+        changed_notes = [
+            {"source": "arxiv", "arxiv_id": "1", "title": "Alpha", "abstract": "Revised abstract"},
+            appended_notes[1],
+            appended_notes[2],
+        ]
+        final_notes = [changed_notes[0], changed_notes[2]]
+        model = FakeEmbeddingModel()
+
+        with TemporaryDirectory() as temp_dir, patch(
+            "app.vector_index.get_sentence_transformer_model",
+            return_value=model,
+        ):
+            index_path = Path(temp_dir) / "prior_art_index.npz"
+            for query, notes in [
+                ("first query", initial_notes),
+                ("second query", appended_notes),
+                ("third query", changed_notes),
+                ("fourth query", final_notes),
+            ]:
+                index = PaperVectorIndex(
+                    index_path=index_path,
+                    model_name="fake-model",
+                    backend="numpy",
+                    query_prefix="",
+                    document_prefix="",
+                )
+                index.search(query, notes, top_k=1)
+
+        document_batches = [
+            call
+            for call in model.calls
+            if call and all(text.startswith("Title:") for text in call)
+        ]
+        self.assertEqual([len(batch) for batch in document_batches], [2, 1, 1])
+        self.assertIn("Title: Gamma", document_batches[1][0])
+        self.assertIn("Revised abstract", document_batches[2][0])
+
+    def test_online_literature_query_bundles_limit_or_terms(self):
+        query = (
+            '"one two" OR "three four" OR "five six" OR "seven eight" OR '
+            '"nine ten" OR "eleven twelve" OR "thirteen fourteen" OR '
+            '"fifteen sixteen" OR "seventeen eighteen" OR "nineteen twenty"'
+        )
+        with patch.dict("app.agents.config", {"literature_or_terms_per_query": 4}, clear=False):
+            bundled = GenerationAgent()._bundle_online_literature_queries([query])
+
+        self.assertEqual([item.count(" OR ") + 1 for item in bundled], [4, 4, 2])
+
     def test_prior_art_ranking_uses_vector_index_without_lexical_prefilter(self):
         class FakeVectorIndex:
             def __init__(self):
@@ -2395,6 +2506,33 @@ critic_llm:
             self.assertEqual(tool._consecutive_failures, 1)
             self.assertEqual(mocked_results.call_count, 2)
             mocked_sleep.assert_called_once_with(0.0)
+
+    def test_arxiv_query_translates_generic_or_phrases_to_field_syntax(self):
+        tool = ArxivSearchTool(max_results=2)
+        query = (
+            '"LoRA vision-language-action robot manipulation" OR '
+            '"in-context learning diffusion policy robot"'
+        )
+
+        translated = tool._arxiv_query(query)
+
+        self.assertIn("all:LoRA AND all:vision AND all:language AND all:action", translated)
+        self.assertIn("all:context AND all:learning AND all:diffusion", translated)
+        self.assertNotIn('"', translated)
+        self.assertNotIn("vision-language-action", translated)
+        self.assertEqual(tool._arxiv_query("au:Geoffrey Hinton"), "au:Geoffrey Hinton")
+
+    def test_semantic_scholar_query_removes_exact_phrase_punctuation(self):
+        tool = SemanticScholarSearchTool()
+
+        translated = tool._semantic_scholar_query(
+            '"LoRA vision-language-action robot manipulation" OR "diffusion-policy robot"'
+        )
+
+        self.assertEqual(
+            translated,
+            "LoRA vision language action robot manipulation | diffusion policy robot",
+        )
 
     def test_arxiv_429_retry_can_recover_live_search(self):
         with TemporaryDirectory() as temp_dir, patch.dict(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -159,9 +160,18 @@ class SemanticScholarSearchTool:
         return headers
 
     def _semantic_scholar_query(self, query: str) -> str:
-        # Semantic Scholar treats space-separated terms as a narrow query; use
-        # its OR separator when upstream planning emits academic OR queries.
-        return " | ".join(part.strip() for part in str(query).split(" OR ") if part.strip()) or str(query)
+        # Keep the provider query source-neutral: strip exact-phrase punctuation
+        # and translate upstream OR bundles to Semantic Scholar's separator.
+        parts = re.split(r"\s+\bOR\b\s+|\s*\|\s*", str(query), flags=re.IGNORECASE)
+        cleaned = []
+        for part in parts:
+            value = part.strip().strip("() ").strip('"')
+            value = re.sub(r"[-/]+", " ", value)
+            value = re.sub(r"[^\w.+# ]+", " ", value, flags=re.UNICODE)
+            value = " ".join(value.split())
+            if value:
+                cleaned.append(value)
+        return " | ".join(cleaned) or str(query)
 
     def _format_paper(self, paper: Dict[str, Any]) -> Dict[str, Any]:
         external_ids = paper.get("externalIds") or {}

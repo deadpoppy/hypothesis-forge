@@ -79,6 +79,7 @@ arxiv_rate_limit_max_retries: 1
 arxiv_rate_limit_retry_after_seconds: 20.0
 arxiv_failure_cooldown_seconds: 900
 arxiv_max_consecutive_failures: 3
+arxiv_max_terms_per_clause: 8
 reference_arxiv_timeout_seconds: 180
 reference_markdown_char_limit: 24000
 
@@ -86,6 +87,8 @@ reference_markdown_char_limit: 24000
 sentence_transformer_enabled: true
 sentence_transformer_model: "BAAI/bge-small-en-v1.5"
 sentence_transformer_local_files_only: false
+# Set to "cpu" on low-memory servers to avoid GPU/MPS runtime memory spikes.
+sentence_transformer_device: null
 prior_art_query_prefix: ""
 prior_art_document_prefix: ""
 

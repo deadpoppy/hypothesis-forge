@@ -12,8 +12,29 @@ from app.config import config
 
 logger = logging.getLogger(__name__)
 
+
 class ArxivSearchTool:
     """Tool for searching and retrieving papers from arXiv"""
+
+    _FIELD_QUERY_RE = re.compile(
+        r"(?i)(?:^|[\s(])(?:all|ti|au|abs|co|jr|cat|rn|id|submittedDate):"
+    )
+    _TOKEN_RE = re.compile(r"[^\W_]+(?:\.[^\W_]+)*", flags=re.UNICODE)
+    _LOW_SIGNAL_TOKENS = {
+        "a",
+        "an",
+        "and",
+        "for",
+        "in",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "using",
+        "via",
+        "with",
+    }
     
     def __init__(self, max_results: int = 10):
         self.max_results = max_results
@@ -85,11 +106,11 @@ class ArxivSearchTool:
             )
             return []
             
-        # Build search query with category filter if provided
-        search_query = query
+        # Translate source-neutral keyword bundles into arXiv field syntax.
+        search_query = self._arxiv_query(query)
         if categories:
             category_filter = " OR ".join([f"cat:{cat}" for cat in categories])
-            search_query = f"({query}) AND ({category_filter})"
+            search_query = f"({search_query}) AND ({category_filter})"
             
         # Set sort criteria
         sort_criterion = arxiv.SortCriterion.Relevance
@@ -203,7 +224,7 @@ class ArxivSearchTool:
         end_str = end_date.strftime("%Y%m%d")
         
         # Add date filter to query
-        date_query = f"({query}) AND submittedDate:[{start_str} TO {end_str}]"
+        date_query = f"({self._arxiv_query(query)}) AND submittedDate:[{start_str} TO {end_str}]"
         return self.search_papers(date_query, max_results, sort_by="submittedDate")
     
     def search_by_category(self, category: str, max_results: Optional[int] = None,
@@ -284,6 +305,32 @@ class ArxivSearchTool:
         # Replace multiple whitespace with single space
         cleaned = re.sub(r'\s+', ' ', text)
         return cleaned.strip()
+
+    def _arxiv_query(self, query: str) -> str:
+        raw_query = " ".join(str(query or "").split())
+        if not raw_query or self._FIELD_QUERY_RE.search(raw_query):
+            return raw_query
+
+        try:
+            max_terms = int(config.get("arxiv_max_terms_per_clause", 8))
+        except (TypeError, ValueError):
+            max_terms = 8
+        max_terms = max(2, min(12, max_terms))
+
+        clauses = re.split(r"\s+\bOR\b\s+", raw_query, flags=re.IGNORECASE)
+        translated = []
+        for clause in clauses:
+            value = clause.strip().strip("() ").strip('"')
+            tokens = self._TOKEN_RE.findall(value.replace("-", " ").replace("/", " "))
+            filtered = [token for token in tokens if token.casefold() not in self._LOW_SIGNAL_TOKENS]
+            if filtered:
+                tokens = filtered
+            tokens = list(dict.fromkeys(tokens))[:max_terms]
+            if not tokens:
+                continue
+            translated.append("(" + " AND ".join(f"all:{token}" for token in tokens) + ")")
+
+        return " OR ".join(translated) or raw_query
     
     def analyze_research_trends(self, query: str, days_back: int = 30) -> Dict:
         """Analyze research trends for a given topic"""

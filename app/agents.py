@@ -771,7 +771,9 @@ class LiteratureMixin:
     def _normalize_search_terms(self, terms: Sequence[Any]) -> List[str]:
         cleaned = []
         for term in coerce_string_list(terms):
-            normalized = " ".join(str(term).replace('"', "").split())
+            normalized = str(term).replace('"', "").strip()
+            normalized = normalized.strip("() ")
+            normalized = " ".join(normalized.split())
             if normalized:
                 cleaned.append(normalized)
         return dedupe_preserve_order(cleaned)
@@ -803,6 +805,12 @@ class LiteratureMixin:
     def _looks_like_boolean_query(self, query: str) -> bool:
         return bool(re.search(r"\b(OR|AND|NOT)\b", str(query), flags=re.IGNORECASE))
 
+    def _boolean_or_terms(self, query: str) -> List[str]:
+        parts = re.split(r"\s+\bOR\b\s+", str(query), flags=re.IGNORECASE)
+        if len(parts) <= 1:
+            return []
+        return self._normalize_search_terms(parts)
+
     def _bundle_online_literature_queries(self, queries: Sequence[str]) -> List[str]:
         clean_queries = dedupe_preserve_order([str(item).strip() for item in queries if str(item).strip()])
         if not clean_queries:
@@ -814,24 +822,33 @@ class LiteratureMixin:
             terms_per_query = 4
         terms_per_query = max(2, min(8, terms_per_query))
 
-        prebuilt_queries: List[str] = []
+        term_groups: List[List[str]] = []
         plain_terms: List[str] = []
         for query in clean_queries:
             if self._looks_like_boolean_query(query):
-                prebuilt_queries.append(query)
+                boolean_terms = self._boolean_or_terms(query)
+                if boolean_terms:
+                    term_groups.append(boolean_terms)
+                else:
+                    plain_terms.append(query)
             else:
                 plain_terms.append(query)
 
-        chunks = [plain_terms[index : index + terms_per_query] for index in range(0, len(plain_terms), terms_per_query)]
+        chunks = [
+            plain_terms[index : index + terms_per_query]
+            for index in range(0, len(plain_terms), terms_per_query)
+        ]
         if len(chunks) > 1 and len(chunks[-1]) == 1:
             chunks[-2].extend(chunks[-1])
             chunks.pop()
+        term_groups.extend(chunks)
 
-        bundled = list(prebuilt_queries)
-        for chunk in chunks:
-            query = self._or_query(chunk)
-            if query:
-                bundled.append(query)
+        bundled = []
+        for group in term_groups:
+            for index in range(0, len(group), terms_per_query):
+                query = self._or_query(group[index : index + terms_per_query])
+                if query:
+                    bundled.append(query)
         return dedupe_preserve_order(bundled)
 
     def _build_default_cycle_literature_term_payload(
@@ -1040,10 +1057,22 @@ class LiteratureMixin:
             if balanced_terms:
                 query_chunks.append(balanced_terms[:10])
 
-        query_chunks = [chunk for chunk in query_chunks if chunk]
-        queries = [self._or_query(chunk) for chunk in query_chunks]
-        queries = [query for query in dedupe_preserve_order(queries) if query]
-        return queries[:query_budget]
+        try:
+            terms_per_query = int(config.get("literature_or_terms_per_query", 4))
+        except (TypeError, ValueError):
+            terms_per_query = 4
+        terms_per_query = max(2, min(8, terms_per_query))
+
+        queries = []
+        for chunk in query_chunks:
+            normalized_chunk = self._normalize_search_terms(chunk)
+            for index in range(0, len(normalized_chunk), terms_per_query):
+                query = self._or_query(normalized_chunk[index : index + terms_per_query])
+                if query:
+                    queries.append(query)
+                if len(queries) >= query_budget:
+                    return dedupe_preserve_order(queries)[:query_budget]
+        return dedupe_preserve_order(queries)[:query_budget]
 
     def _batch_literature_query_budget(self, research_goal: ResearchGoal, hypotheses: Sequence[Hypothesis]) -> int:
         if not hypotheses:
