@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -42,7 +44,7 @@ from app.reports import build_markdown_report
 from app.tools.arxiv_search import ArxivSearchTool
 from app.tools.semantic_scholar import SemanticScholarSearchTool
 from app.trajectory import analyze_run_payload
-from app.utils import coerce_string_list, similarity_score
+from app.utils import coerce_string_list, embedding_slot, run_concurrently, similarity_score
 from app.vector_index import PaperVectorIndex, paper_recall_text
 from app.workflow import SupervisorAgent
 
@@ -1614,6 +1616,28 @@ critic_llm:
         self.assertEqual([len(batch) for batch in document_batches], [2, 1, 1])
         self.assertIn("Title: Gamma", document_batches[1][0])
         self.assertIn("Revised abstract", document_batches[2][0])
+
+    def test_embedding_concurrency_is_separate_from_general_concurrency(self):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def worker(_item):
+            nonlocal active, max_active
+            with embedding_slot():
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.01)
+                with lock:
+                    active -= 1
+            return "done"
+
+        with patch.dict("app.utils.config", {"max_concurrency": 16, "embedding_concurrency": 1}, clear=False):
+            results = run_concurrently(list(range(8)), worker)
+
+        self.assertEqual(results, ["done"] * 8)
+        self.assertEqual(max_active, 1)
 
     def test_online_literature_query_bundles_limit_or_terms(self):
         query = (

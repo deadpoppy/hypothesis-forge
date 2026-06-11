@@ -11,7 +11,7 @@ import numpy as np
 
 from .config import config
 from .literature import _paper_key, dedupe_notes
-from .utils import get_sentence_transformer_model, logger
+from .utils import embedding_slot, get_sentence_transformer_model, logger
 
 
 RECALL_TEXT_VERSION = "title_abstract_full_v2"
@@ -224,16 +224,17 @@ class PaperVectorIndex:
         return self._normalize_embeddings(array)
 
     def _encode_batch(self, model: Any, texts: Sequence[str]) -> np.ndarray:
-        try:
-            embeddings = model.encode(
-                list(texts),
-                batch_size=min(self.batch_size, len(texts)),
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-        except TypeError:
-            embeddings = model.encode(list(texts), convert_to_numpy=True)
+        with embedding_slot():
+            try:
+                embeddings = model.encode(
+                    list(texts),
+                    batch_size=min(self.batch_size, len(texts)),
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+            except TypeError:
+                embeddings = model.encode(list(texts), convert_to_numpy=True)
 
         array = np.asarray(embeddings, dtype=np.float32)
         if array.ndim == 1:

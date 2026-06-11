@@ -37,8 +37,10 @@ num_hypotheses: 5
 top_k_hypotheses: 3
 max_literature_results: 6
 ranking_matches_per_cycle: 1000
-# Keep network/search breadth unchanged, but serialize memory-heavy local work.
-max_concurrency: 1
+# LLM, ranking, review, and online literature request concurrency.
+max_concurrency: 16
+# Local SentenceTransformer encode concurrency. Keep this at 1 on low-memory hosts.
+embedding_concurrency: 1
 
 # Scoring, review, reranking, and lifecycle controls
 elo_k_factor: 32

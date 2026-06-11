@@ -6,6 +6,7 @@ import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Callable, Dict, Iterable, List, Sequence, TypeVar
 
@@ -46,6 +47,30 @@ def get_max_concurrency(limit: int | None = None) -> int:
     except (TypeError, ValueError):
         value = 8
     return max(1, min(32, value))
+
+
+def get_embedding_concurrency() -> int:
+    try:
+        value = int(config.get("embedding_concurrency", 1))
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(8, value))
+
+
+_embedding_semaphores: Dict[int, threading.BoundedSemaphore] = {}
+_embedding_semaphores_lock = threading.Lock()
+
+
+@contextmanager
+def embedding_slot():
+    concurrency = get_embedding_concurrency()
+    with _embedding_semaphores_lock:
+        semaphore = _embedding_semaphores.get(concurrency)
+        if semaphore is None:
+            semaphore = threading.BoundedSemaphore(concurrency)
+            _embedding_semaphores[concurrency] = semaphore
+    with semaphore:
+        yield
 
 
 def run_concurrently(items: Sequence[T], worker: Callable[[T], R], max_workers: int | None = None) -> List[R]:
@@ -204,7 +229,8 @@ def lexical_similarity_score(text_a: str, text_b: str) -> float:
 @lru_cache(maxsize=4096)
 def _cached_embedding(text: str):
     model = get_sentence_transformer_model()
-    return model.encode(text, convert_to_tensor=True)
+    with embedding_slot():
+        return model.encode(text, convert_to_tensor=True)
 
 
 def similarity_score(text_a: str, text_b: str) -> float:

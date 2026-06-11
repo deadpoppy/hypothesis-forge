@@ -246,9 +246,11 @@ def run_cycles(args: argparse.Namespace) -> Dict[str, str]:
     _require_llm_api_key()
     research_goal = _build_research_goal(args, constraints)
     logger.info(
-        "Runtime memory controls: max_concurrency=%d sentence_transformer_device=%s "
+        "Runtime concurrency controls: max_concurrency=%d embedding_concurrency=%s "
+        "sentence_transformer_device=%s "
         "vector_batch_size=%s vector_backend=%s vector_search_chunk_size=%s",
         research_goal.max_concurrency,
+        config.get("embedding_concurrency", 1),
         config.get("sentence_transformer_device") or "auto",
         config.get("prior_art_vector_batch_size", 64),
         config.get("prior_art_vector_index_backend", "auto"),
