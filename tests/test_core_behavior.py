@@ -7,8 +7,6 @@ import sys
 import threading
 import time
 import unittest
-import urllib.error
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -16,24 +14,20 @@ from unittest.mock import patch
 from app.agents import (
     EvolutionAgent,
     GenerationAgent,
+    IdeaLiteratureAgent,
     MetaReviewAgent,
     OpenCodeRerankingAgent,
-    PriorArtAgent,
     ProximityAgent,
     RankingAgent,
     ReflectionAgent,
     _extract_hypothesis_items,
     _evolution_source_budget_for_cycle,
     _evolution_temperature_for_cycle,
-    _focus_area_query_variants,
     _generation_temperature_for_cycle,
-    _literature_budget_for_step,
     _prioritize_diverse_hypotheses,
-    _round_robin_query_bundle,
     _select_evolution_sources,
     _trajectory_state_snapshot,
 )
-from app.literature import LiteratureCache, LiteratureSearchService, dedupe_notes
 import app.llm as llm_module
 import app.reference as reference_module
 from app.llm import LLMCallError, call_llm, extract_json_payload
@@ -41,11 +35,8 @@ from app.models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan
 from app.prompts import _serialize_literature, build_evolution_messages, build_generation_messages, build_meta_review_messages
 from app.reference import ReferencePaperError, normalize_arxiv_reference
 from app.reports import build_markdown_report
-from app.tools.arxiv_search import ArxivSearchTool
-from app.tools.semantic_scholar import SemanticScholarSearchTool
 from app.trajectory import analyze_run_payload
 from app.utils import coerce_string_list, embedding_slot, run_concurrently, similarity_score
-from app.vector_index import PaperVectorIndex, paper_recall_text
 from app.workflow import SupervisorAgent
 
 
@@ -625,57 +616,6 @@ critic_llm:
         self.assertIn("H4", selected_ids)
         self.assertLess(selected_ids.count("H1") + selected_ids.count("H2"), 2)
 
-    def test_literature_budget_trims_mature_clustered_cycle(self):
-        goal = ResearchGoal("goal", max_literature_results=5)
-        query_budget, max_results, adjustments = _literature_budget_for_step(
-            goal,
-            trajectory_state={
-                "uncovered_focus_areas": [],
-                "frontier_focus_gaps": [],
-                "overexplored_areas": ["KV cache", "Speculative decoding"],
-            },
-            step_name="generation",
-            iteration_number=3,
-        )
-
-        self.assertEqual(query_budget, 2)
-        self.assertEqual(max_results, 3)
-        self.assertIn("mature_frontier_trim", adjustments)
-
-    def test_focus_area_query_variants_add_search_friendly_runtime_routing_terms(self):
-        variants = _focus_area_query_variants("runtime routing or input-adaptive inference control")
-
-        self.assertIn("runtime adaptive inference routing llm", variants)
-        self.assertIn("input adaptive inference control transformer serving", variants)
-
-    def test_generation_query_builder_expands_focus_area_variants(self):
-        goal = ResearchGoal("goal")
-        plan = ResearchPlan.from_goal(goal)
-        agent = GenerationAgent()
-        hypothesis = Hypothesis(
-            "H1",
-            "Adaptive Router",
-            "route requests dynamically",
-            focus_area="runtime routing or input-adaptive inference control",
-        )
-
-        queries = agent._build_queries(goal, plan, hypothesis)
-
-        self.assertIn("Adaptive Router", queries)
-        self.assertIn("runtime adaptive inference routing llm", queries)
-
-    def test_round_robin_query_bundle_spreads_across_focus_areas_first(self):
-        queries = _round_robin_query_bundle(
-            [
-                ["focus_a_raw", "focus_a_alt"],
-                ["focus_b_raw", "focus_b_alt"],
-                ["focus_c_raw", "focus_c_alt"],
-            ],
-            limit=3,
-        )
-
-        self.assertEqual(queries, ["focus_a_raw", "focus_b_raw", "focus_c_raw"])
-
     def test_ranking_reuses_cached_pairwise_decision_without_recounting_elo(self):
         goal = ResearchGoal("goal", ranking_matches_per_cycle=1, max_literature_results=0)
         context = ContextMemory()
@@ -969,7 +909,7 @@ critic_llm:
             Hypothesis("H3", "Kernel Fusion", "fuse entropy kernels into attention path", focus_area="Kernel fusion", elo_score=1260)
         )
 
-        with patch.object(EvolutionAgent, "_search_literature", return_value=[]), patch(
+        with patch(
             "app.agents.call_json",
             return_value={
                 "hypotheses": [
@@ -1003,7 +943,7 @@ critic_llm:
         context.reset_for_goal(goal)
         context.research_plan = ResearchPlan.from_goal(goal)
 
-        with patch.object(GenerationAgent, "_search_literature", return_value=[]), patch(
+        with patch(
             "app.agents.call_json",
             side_effect=[
                 {
@@ -1075,7 +1015,7 @@ critic_llm:
         context.add_hypothesis(Hypothesis("H3", "Kernel Fusion", "fuse entropy kernels into attention path", focus_area="Kernel fusion", elo_score=1270))
         context.add_hypothesis(Hypothesis("H4", "Scheduler", "schedule by queue depth", focus_area="Scheduling", elo_score=1240))
 
-        with patch.object(EvolutionAgent, "_search_literature", return_value=[]), patch(
+        with patch(
             "app.agents.call_json",
             side_effect=[
                 {
@@ -1166,7 +1106,6 @@ critic_llm:
             research_goal="goal",
             research_plan={},
             context_hypotheses=[],
-            literature_notes=[],
             meta_feedback={},
             research_overview={},
             trajectory_state={},
@@ -1197,7 +1136,7 @@ critic_llm:
         self.assertIn("method-stacking patterns", prompt)
         self.assertIn("frontier_storyline", prompt)
 
-    def test_unified_review_reuses_seeded_and_parent_literature_for_evolved_hypotheses(self):
+    def test_unified_review_uses_only_the_ideas_opencode_literature(self):
         goal = ResearchGoal("goal", max_literature_results=3, reflection_temperature=0.3)
         context = ContextMemory()
         context.reset_for_goal(goal)
@@ -1209,8 +1148,8 @@ critic_llm:
             "share kv cache across nearby tokens",
             focus_area="KV cache sharing",
             literature_notes=[
-                {"source": "arxiv", "arxiv_id": "2501.00001v1", "title": "Parent Paper A"},
-                {"source": "arxiv", "arxiv_id": "2501.00002v1", "title": "Parent Paper B"},
+                {"source": "opencode", "title": "Parent Paper A"},
+                {"source": "opencode", "title": "Parent Paper B"},
             ],
         )
         child = Hypothesis(
@@ -1221,13 +1160,13 @@ critic_llm:
             origin="evolution",
             parent_ids=["H1"],
             literature_notes=[
-                {"source": "arxiv", "arxiv_id": "2501.00003v1", "title": "Child Paper"},
+                {"source": "opencode", "title": "Child Paper"},
             ],
         )
         context.add_hypothesis(parent)
         context.add_hypothesis(child)
 
-        with patch.object(ReflectionAgent, "_search_literature", return_value=[]) as mocked_search, patch(
+        with patch(
             "app.agents.call_json",
             return_value={
                 "alignment_score": 4,
@@ -1241,53 +1180,11 @@ critic_llm:
         ):
             result = ReflectionAgent().review_hypotheses([child], goal, context)
 
-        self.assertEqual(mocked_search.call_count, 0)
-        self.assertEqual(len(result.data["literature_by_hypothesis"]["E1"]), 3)
-        self.assertEqual(len(child.literature_notes), 3)
+        notes = result.data["literature_by_hypothesis"]["E1"]
+        self.assertEqual([note["title"] for note in notes], ["Child Paper"])
+        self.assertEqual([note["title"] for note in child.literature_notes], ["Child Paper"])
 
-    def test_unified_review_fills_missing_literature_from_local_embedding_recall(self):
-        goal = ResearchGoal("goal", max_literature_results=2, reflection_temperature=0.3)
-        context = ContextMemory()
-        context.reset_for_goal(goal)
-        context.research_plan = ResearchPlan.from_goal(goal)
-        hypothesis = Hypothesis("H1", "Adaptive Router", "route requests by cache pressure")
-        local_paper = {
-            "source": "arxiv",
-            "arxiv_id": "2501.00004v1",
-            "title": "Cache Pressure Routing",
-            "abstract": "Routing requests by cache pressure.",
-        }
-
-        class FakeVectorIndex:
-            def search(self, _query_text, notes, top_k):
-                return [{"note": notes[0], "semantic_score": 0.88, "vector_rank": 1, "vector_index_backend": "fake"}][:top_k]
-
-        agent = ReflectionAgent()
-        with patch.object(agent.literature_service, "local_corpus", return_value=[local_paper]), patch.object(
-            agent,
-            "_search_literature",
-            return_value=[],
-        ) as mocked_search, patch("app.agents.get_prior_art_vector_index", return_value=FakeVectorIndex()), patch(
-            "app.agents.call_json",
-            return_value={
-                "alignment_score": 4,
-                "novelty_score": 4,
-                "plausibility_score": 4,
-                "feasibility_score": 4,
-                "testability_score": 4,
-                "verdict": "advance",
-                "short_summary": "Local-library grounded review.",
-            },
-        ):
-            result = agent.review_hypotheses([hypothesis], goal, context)
-
-        notes = result.data["literature_by_hypothesis"]["H1"]
-        self.assertEqual(mocked_search.call_count, 0)
-        self.assertEqual(notes[0]["title"], "Cache Pressure Routing")
-        self.assertEqual(notes[0]["selection_reason"], "review_local_embedding")
-        self.assertEqual(hypothesis.literature_notes[0]["semantic_score"], 0.88)
-
-    def test_meta_review_reuses_ranked_hypothesis_literature_before_searching(self):
+    def test_meta_review_reuses_ranked_hypothesis_literature_without_searching(self):
         goal = ResearchGoal("goal", max_literature_results=3, reflection_temperature=0.3)
         context = ContextMemory()
         context.reset_for_goal(goal)
@@ -1305,7 +1202,7 @@ critic_llm:
         )
         context.add_hypothesis(hypothesis)
 
-        with patch.object(MetaReviewAgent, "_search_literature", return_value=[]) as mocked_search, patch(
+        with patch(
             "app.agents.call_json",
             return_value={
                 "meta_review_critique": ["Keep going"],
@@ -1318,7 +1215,6 @@ critic_llm:
         ):
             result = MetaReviewAgent().summarize_and_feedback(goal, context, {"clusters": [], "duplicate_candidates": []})
 
-        self.assertEqual(mocked_search.call_count, 0)
         self.assertEqual(result.data["literature_reuse_count"], 3)
 
     def test_markdown_report_surfaces_story_fields(self):
@@ -1379,277 +1275,109 @@ critic_llm:
         self.assertIn("Frontier story:", report)
         self.assertIn("Frontier storyline:", report)
 
-    def test_prior_art_check_skips_unchanged_idea_signature(self):
-        goal = ResearchGoal("goal", enable_prior_art_check=True)
+    def test_idea_literature_skips_unchanged_idea_signature(self):
+        goal = ResearchGoal("goal", enable_idea_literature=True)
         context = ContextMemory()
         context.reset_for_goal(goal)
         context.research_plan = ResearchPlan.from_goal(goal)
-        hypothesis = Hypothesis("H1", "Cached Idea", "Idea text")
-        hypothesis.prior_art_signature = hypothesis.idea_signature()
-        hypothesis.prior_art_audit = {"novelty_risk": "low", "decision": "keep"}
-        agent = PriorArtAgent()
+        hypothesis = Hypothesis(
+            "H1",
+            "Cached Idea",
+            "Idea text",
+            literature_notes=[{"source": "opencode", "title": "Cached Paper"}],
+        )
+        hypothesis.literature_fetch_signature = hypothesis.idea_signature()
+        agent = IdeaLiteratureAgent()
 
-        with patch.object(
-            agent.literature_service,
-            "prefetch_corpus",
-            return_value={},
-        ) as mocked_prefetch:
+        with patch("app.agents.subprocess.run") as mocked_run:
             result = agent.check_hypotheses([hypothesis], goal, context)
 
         self.assertEqual(result.data["checked_count"], 0)
         self.assertEqual(result.data["skipped_count"], 1)
         self.assertEqual(result.data["audits"]["H1"]["status"], "skipped_unchanged")
-        self.assertEqual(mocked_prefetch.call_count, 0)
+        self.assertEqual(mocked_run.call_count, 0)
 
-    def test_prior_art_prefetches_one_complete_query_for_all_active_ideas(self):
-        goal = ResearchGoal(
-            "goal",
-            enable_prior_art_check=True,
-            prior_art_embedding_candidates=1,
-            prior_art_review_top_k=1,
-            prior_art_similarity_threshold=0.5,
-            max_concurrency=1,
-        )
+    def test_idea_literature_fetches_related_papers_once_per_idea_with_opencode(self):
+        goal = ResearchGoal("goal", enable_idea_literature=True, max_literature_results=3, max_concurrency=1)
         context = ContextMemory()
         context.reset_for_goal(goal)
         context.research_plan = ResearchPlan.from_goal(goal)
-        first = Hypothesis("H1", "Cache Router", "Route requests by cache pressure.", search_queries=["cache routing"])
-        second = Hypothesis("H2", "Spec Verifier", "Verify drafts with fused kernels.", search_queries=["draft verification"])
-        agent = PriorArtAgent()
-        paper = {"source": "arxiv", "arxiv_id": "2501.00001v1", "title": "Local Paper", "abstract": "background"}
+        first = Hypothesis("H1", "Cache Router", "Route requests by cache pressure.")
+        second = Hypothesis("H2", "Spec Verifier", "Verify speculative drafts.")
 
-        class FakeVectorIndex:
-            def search(self, _query_text, notes, top_k):
-                return [{"note": notes[0], "semantic_score": 0.1, "vector_rank": 1, "vector_index_backend": "fake"}][:top_k]
-
-        batch_term_payload = {
-            "ideas": [
-                {
-                    "idea_id": "H1",
-                    "idea_title": "Cache Router",
-                    "search_terms": [
-                        "route requests by cache pressure",
-                        "transformer serving",
-                        "KV cache",
-                    ],
-                    "broader_terms": ["LLM inference"],
-                    "rationale": "broad serving vocabulary",
-                },
-                {
-                    "idea_id": "H2",
-                    "idea_title": "Spec Verifier",
-                    "search_terms": [
-                        "verify drafts with fused kernels",
-                        "speculative decoding",
-                        "kernel fusion",
-                    ],
-                    "broader_terms": ["LLM acceleration"],
-                    "rationale": "broad decoding vocabulary",
-                },
-            ],
-            "shared_terms": ["large language model inference", "transformer inference"],
-            "shared_broader_terms": ["efficient inference"],
-            "notes": ["batch terms"],
-        }
-        audit_payload = {
-            "novelty_risk": "low",
-            "decision": "keep",
-            "short_summary": "Batch search was grounded in the local corpus.",
-            "overlap_assessment": [],
-            "gap_analysis": [],
-            "repair_strategy": "",
-            "revised_hypothesis": {},
-        }
-        captured_queries = {}
-
-        def fake_prefetch(queries, results_per_query, max_total=None):
-            captured_queries["queries"] = list(queries)
-            captured_queries["results_per_query"] = results_per_query
-            return {
-                "queries": list(queries),
-                "query_count": len(queries),
-                "results_per_query": results_per_query,
-                "fetched_count": 1,
-                "local_corpus_size": 1,
-                "source_counts": {"arxiv": 1},
-                "query_source_counts": {},
-                "cache_counts": {},
-                "sample_titles": ["Local Paper"],
+        def fake_run(command, **kwargs):
+            self.assertEqual(command[:3], ["opencode", "run", "--dangerously-skip-permissions"])
+            prompt = json.loads(command[3])
+            idea_id = prompt["idea"]["id"]
+            payload = {
+                "papers": [
+                    {
+                        "title": f"Paper for {idea_id}",
+                        "authors": ["Researcher"],
+                        "year": "2026",
+                        "url": f"https://example.test/{idea_id}",
+                        "summary": f"Relevant to {idea_id}.",
+                        "relevance": "Directly related.",
+                    }
+                ],
+                "search_terms": [prompt["idea"]["title"]],
+                "search_summary": f"Found papers for {idea_id}.",
             }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
 
-        with patch(
-            "app.agents.call_json",
-            side_effect=[batch_term_payload, audit_payload],
-        ) as mocked_call, patch.object(
-            agent.literature_service,
-            "prefetch_corpus",
-            side_effect=fake_prefetch,
-        ) as mocked_prefetch, patch.object(
-            agent.literature_service,
-            "local_corpus",
-            return_value=[paper],
-        ) as mocked_local, patch("app.agents.get_prior_art_vector_index", return_value=FakeVectorIndex()), patch(
-            "app.agents.lexical_similarity_score",
-            return_value=0.0,
-        ):
-            result = agent.check_hypotheses([first, second], goal, context)
+        with patch("app.agents.subprocess.run", side_effect=fake_run) as mocked_run:
+            result = IdeaLiteratureAgent().check_hypotheses([first, second], goal, context)
 
-        self.assertEqual(mocked_call.call_count, 1)
-        self.assertEqual(mocked_prefetch.call_count, 1)
-        self.assertGreaterEqual(captured_queries["results_per_query"], 1000)
-        self.assertEqual(mocked_local.call_count, 1)
-        self.assertEqual(len(captured_queries["queries"]), 1)
-        combined_query = captured_queries["queries"][0]
-        self.assertIn(" OR ", combined_query)
-        self.assertIn("transformer serving", combined_query)
-        self.assertIn("KV cache", combined_query)
-        self.assertIn("LLM inference", combined_query)
-        self.assertIn("speculative decoding", combined_query)
-        self.assertIn("kernel fusion", combined_query)
-        self.assertIn("large language model inference", combined_query)
-        self.assertNotIn("route requests by cache pressure", combined_query)
-        self.assertNotIn("verify drafts with fused kernels", combined_query)
+        self.assertEqual(mocked_run.call_count, 2)
         self.assertEqual(result.data["checked_count"], 2)
-        self.assertEqual(result.data["query_count"], 1)
-        self.assertEqual(result.data["batch_prefetch"]["query_count"], 1)
-        self.assertEqual(result.data["batch_prefetch"]["query"], combined_query)
-        self.assertEqual(result.data["retrieval_mode"], "batch_prefetch_local_vector_index_embedding")
+        self.assertEqual(result.data["fetched_count"], 2)
+        self.assertEqual(result.data["retrieval_mode"], "opencode_per_idea_once")
+        self.assertEqual(first.literature_notes[0]["title"], "Paper for H1")
+        self.assertEqual(second.literature_notes[0]["title"], "Paper for H2")
+        self.assertEqual(first.literature_notes[0]["source"], "opencode")
+        self.assertEqual(first.literature_fetch_signature, first.idea_signature())
+        self.assertEqual(second.literature_fetch_signature, second.idea_signature())
 
-    def test_paper_vector_index_persists_and_ranks_by_embedding(self):
-        class FakeEmbeddingModel:
-            def encode(self, texts, **_kwargs):
-                vectors = []
-                for text in texts:
-                    normalized = text.casefold()
-                    if "beta" in normalized:
-                        vectors.append([1.0, 0.0])
-                    elif "alpha" in normalized:
-                        vectors.append([0.0, 1.0])
-                    else:
-                        vectors.append([0.7, 0.3])
-                return vectors
+    def test_idea_literature_does_not_repeat_successful_empty_opencode_fetch(self):
+        goal = ResearchGoal("goal", enable_idea_literature=True, max_literature_results=3, max_concurrency=1)
+        context = ContextMemory()
+        context.reset_for_goal(goal)
+        context.research_plan = ResearchPlan.from_goal(goal)
+        hypothesis = Hypothesis("H1", "Sparse Topic", "A narrowly scoped idea.")
+        completed = subprocess.CompletedProcess(
+            ["opencode"],
+            0,
+            stdout=json.dumps({"papers": [], "search_summary": "No reliable papers found."}),
+            stderr="",
+        )
 
-        notes = [
-            {"source": "arxiv", "arxiv_id": "1", "title": "Alpha Compression"},
-            {"source": "arxiv", "arxiv_id": "2", "title": "Beta Retrieval"},
-        ]
-        with TemporaryDirectory() as temp_dir, patch(
-            "app.vector_index.get_sentence_transformer_model",
-            return_value=FakeEmbeddingModel(),
-        ):
-            index_path = Path(temp_dir) / "prior_art_index.npz"
-            index = PaperVectorIndex(
-                index_path=index_path,
-                model_name="fake-model",
-                backend="numpy",
-                query_prefix="",
-                document_prefix="",
-            )
-            results = index.search("beta query", notes, top_k=1)
-            index_exists = index_path.exists()
+        with patch("app.agents.subprocess.run", return_value=completed) as mocked_run:
+            first = IdeaLiteratureAgent().check_hypotheses([hypothesis], goal, context)
+            second = IdeaLiteratureAgent().check_hypotheses([hypothesis], goal, context)
 
-        self.assertEqual(results[0]["note"]["title"], "Beta Retrieval")
-        self.assertEqual(results[0]["vector_index_backend"], "numpy")
-        self.assertTrue(index_exists)
+        self.assertEqual(mocked_run.call_count, 1)
+        self.assertEqual(first.data["audits"]["H1"]["status"], "empty")
+        self.assertEqual(second.data["audits"]["H1"]["status"], "skipped_unchanged")
 
-    def test_paper_vector_index_builds_once_under_concurrent_searches(self):
-        class FakeEmbeddingModel:
-            def __init__(self):
-                self.calls = []
+    def test_idea_literature_does_not_repeat_failed_opencode_fetch(self):
+        goal = ResearchGoal("goal", enable_idea_literature=True, max_literature_results=3, max_concurrency=1)
+        context = ContextMemory()
+        context.reset_for_goal(goal)
+        context.research_plan = ResearchPlan.from_goal(goal)
+        hypothesis = Hypothesis("H1", "Sparse Topic", "A narrowly scoped idea.")
+        completed = subprocess.CompletedProcess(["opencode"], 1, stdout="", stderr="failed")
 
-            def encode(self, texts, **_kwargs):
-                values = list(texts)
-                self.calls.append(values)
-                return [
-                    [1.0, 0.0] if "beta" in text.casefold() else [0.0, 1.0]
-                    for text in values
-                ]
+        with patch("app.agents.subprocess.run", return_value=completed) as mocked_run:
+            first = IdeaLiteratureAgent().check_hypotheses([hypothesis], goal, context)
+            second = IdeaLiteratureAgent().check_hypotheses([hypothesis], goal, context)
 
-        notes = [
-            {"source": "arxiv", "arxiv_id": "1", "title": "Alpha Compression"},
-            {"source": "arxiv", "arxiv_id": "2", "title": "Beta Retrieval"},
-        ]
-        model = FakeEmbeddingModel()
-        with TemporaryDirectory() as temp_dir, patch(
-            "app.vector_index.get_sentence_transformer_model",
-            return_value=model,
-        ):
-            index = PaperVectorIndex(
-                index_path=Path(temp_dir) / "prior_art_index.npz",
-                model_name="fake-model",
-                backend="numpy",
-                query_prefix="",
-                document_prefix="",
-            )
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                results = list(executor.map(lambda _: index.search("beta query", notes, top_k=1), range(4)))
+        self.assertEqual(mocked_run.call_count, 1)
+        self.assertEqual(first.data["audits"]["H1"]["status"], "error")
+        self.assertEqual(second.data["audits"]["H1"]["status"], "skipped_unchanged")
 
-        corpus_builds = [call for call in model.calls if len(call) == len(notes)]
-        self.assertEqual(len(corpus_builds), 1)
-        self.assertTrue(all(result[0]["note"]["title"] == "Beta Retrieval" for result in results))
 
-    def test_paper_vector_index_incrementally_encodes_only_new_or_changed_papers(self):
-        class FakeEmbeddingModel:
-            def __init__(self):
-                self.calls = []
 
-            def encode(self, texts, **_kwargs):
-                values = list(texts)
-                self.calls.append(values)
-                vectors = []
-                for text in values:
-                    normalized = text.casefold()
-                    if "gamma" in normalized:
-                        vectors.append([1.0, 0.0, 0.0])
-                    elif "revised" in normalized:
-                        vectors.append([0.0, 1.0, 0.0])
-                    else:
-                        vectors.append([0.0, 0.0, 1.0])
-                return vectors
 
-        initial_notes = [
-            {"source": "arxiv", "arxiv_id": "1", "title": "Alpha", "abstract": "Original"},
-            {"source": "arxiv", "arxiv_id": "2", "title": "Beta", "abstract": "Original"},
-        ]
-        appended_notes = initial_notes + [
-            {"source": "arxiv", "arxiv_id": "3", "title": "Gamma", "abstract": "New paper"},
-        ]
-        changed_notes = [
-            {"source": "arxiv", "arxiv_id": "1", "title": "Alpha", "abstract": "Revised abstract"},
-            appended_notes[1],
-            appended_notes[2],
-        ]
-        final_notes = [changed_notes[0], changed_notes[2]]
-        model = FakeEmbeddingModel()
-
-        with TemporaryDirectory() as temp_dir, patch(
-            "app.vector_index.get_sentence_transformer_model",
-            return_value=model,
-        ):
-            index_path = Path(temp_dir) / "prior_art_index.npz"
-            for query, notes in [
-                ("first query", initial_notes),
-                ("second query", appended_notes),
-                ("third query", changed_notes),
-                ("fourth query", final_notes),
-            ]:
-                index = PaperVectorIndex(
-                    index_path=index_path,
-                    model_name="fake-model",
-                    backend="numpy",
-                    query_prefix="",
-                    document_prefix="",
-                )
-                index.search(query, notes, top_k=1)
-
-        document_batches = [
-            call
-            for call in model.calls
-            if call and all(text.startswith("Title:") for text in call)
-        ]
-        self.assertEqual([len(batch) for batch in document_batches], [2, 1, 1])
-        self.assertIn("Title: Gamma", document_batches[1][0])
-        self.assertIn("Revised abstract", document_batches[2][0])
 
     def test_embedding_concurrency_is_separate_from_general_concurrency(self):
         active = 0
@@ -1673,254 +1401,12 @@ critic_llm:
         self.assertEqual(results, ["done"] * 8)
         self.assertEqual(max_active, 1)
 
-    def test_online_literature_query_bundles_limit_or_terms(self):
-        query = (
-            '"one two" OR "three four" OR "five six" OR "seven eight" OR '
-            '"nine ten" OR "eleven twelve" OR "thirteen fourteen" OR '
-            '"fifteen sixteen" OR "seventeen eighteen" OR "nineteen twenty"'
-        )
-        with patch.dict("app.agents.config", {"literature_or_terms_per_query": 4}, clear=False):
-            bundled = GenerationAgent()._bundle_online_literature_queries([query])
 
-        self.assertEqual([item.count(" OR ") + 1 for item in bundled], [4, 4, 2])
 
-    def test_prior_art_ranking_uses_vector_index_without_lexical_prefilter(self):
-        class FakeVectorIndex:
-            def __init__(self):
-                self.seen_corpus_sizes = []
 
-            def search(self, _query_text, notes, top_k):
-                self.seen_corpus_sizes.append(len(notes))
-                return [
-                    {
-                        "note": notes[1],
-                        "semantic_score": 0.91,
-                        "vector_rank": 1,
-                        "vector_index_backend": "fake",
-                    }
-                ][:top_k]
 
-        goal = ResearchGoal("goal", prior_art_embedding_candidates=1, prior_art_review_top_k=1)
-        hypothesis = Hypothesis("H1", "Target Idea", "Find semantic target paper.")
-        lexical_bait = {"source": "arxiv", "arxiv_id": "1", "title": "Target Idea lexical bait"}
-        semantic_target = {"source": "arxiv", "arxiv_id": "2", "title": "Semantic Match"}
-        fake_index = FakeVectorIndex()
 
-        with patch("app.agents.get_prior_art_vector_index", return_value=fake_index), patch(
-            "app.agents.lexical_similarity_score",
-            side_effect=lambda _left, right: 1.0 if "lexical bait" in right else 0.0,
-        ):
-            ranked = PriorArtAgent()._rank_prior_art(hypothesis, [lexical_bait, semantic_target], goal)
 
-        self.assertEqual(fake_index.seen_corpus_sizes, [2])
-        self.assertEqual(ranked[0]["title"], "Semantic Match")
-        self.assertEqual(ranked[0]["recall_score"], 0.91)
-
-    def test_prior_art_embedding_text_uses_title_abstract_only(self):
-        hypothesis = Hypothesis(
-            "H1",
-            "Compact Query",
-            "Core abstract sentence about the proposed method.",
-            mechanism="This mechanism should not be duplicated when text exists.",
-            rationale="This rationale should not be duplicated when text exists.",
-            predictions=["Prediction text should stay out of embedding queries."],
-            validation_experiments=["Experiment text should stay out of embedding queries."],
-        )
-
-        idea_text = PriorArtAgent()._idea_recall_text(hypothesis)
-        paper_text = paper_recall_text(
-            {
-                "title": "Compact Paper",
-                "abstract": "Paper abstract sentence.",
-                "citation": "Citation should stay out.",
-                "venue": "Venue should stay out.",
-            }
-        )
-
-        self.assertIn("Title: Compact Query", idea_text)
-        self.assertIn("Abstract: Core abstract sentence", idea_text)
-        self.assertNotIn("Mechanism:", idea_text)
-        self.assertNotIn("Novelty rationale:", idea_text)
-        self.assertNotIn("Prediction text", idea_text)
-        self.assertNotIn("Experiment text", idea_text)
-        self.assertNotIn("This mechanism should not be duplicated", idea_text)
-        self.assertIn("Title: Compact Paper", paper_text)
-        self.assertIn("Abstract: Paper abstract sentence.", paper_text)
-        self.assertNotIn("Citation should stay out", paper_text)
-        self.assertNotIn("Venue should stay out", paper_text)
-
-    def test_prior_art_check_repairs_duplicate_and_rechecks_new_signature(self):
-        goal = ResearchGoal(
-            "goal",
-            llm_model="thinking-model",
-            critic_llm_model="critic-model",
-            enable_prior_art_check=True,
-            prior_art_embedding_candidates=1,
-            prior_art_review_top_k=1,
-            prior_art_similarity_threshold=0.5,
-            prior_art_repair_attempts=1,
-        )
-        context = ContextMemory()
-        context.reset_for_goal(goal)
-        context.research_plan = ResearchPlan.from_goal(goal)
-        hypothesis = Hypothesis("H1", "Duplicate Idea", "Reuse exact mechanism from prior work.")
-        agent = PriorArtAgent()
-        paper = {
-            "source": "arxiv",
-            "arxiv_id": "2501.00001v1",
-            "title": "Prior Duplicate",
-            "summary": "Prior work uses the same mechanism.",
-            "arxiv_url": "https://arxiv.org/abs/2501.00001v1",
-        }
-        audit_payload = {
-            "novelty_risk": "high",
-            "decision": "repair",
-            "short_summary": "The original mechanism is already covered.",
-            "overlap_assessment": [
-                {
-                    "paper_title": "Prior Duplicate",
-                    "problem_overlap": "high",
-                    "mechanism_overlap": "high",
-                    "claim_overlap": "high",
-                    "duplicate_level": "strong",
-                    "rationale": "Same problem, mechanism, and novelty claim.",
-                }
-            ],
-            "gap_analysis": ["Prior work lacks queue-aware gating."],
-            "repair_strategy": "Move the claim to queue-aware gating.",
-            "revised_hypothesis": {
-                "title": "Queue-Aware Gap Idea",
-                "focus_area": "runtime routing",
-                "primary_bottleneck": "latency",
-                "core_hypothesis": "Use queue-aware gating to avoid the prior duplicate mechanism.",
-                "mechanism": "A queue-state controller chooses when reuse is safe.",
-                "novelty_rationale": "Targets a scheduling gap not covered by the prior work.",
-                "predictions": ["Tail latency improves."],
-                "test_plan": ["Replay bursty traces."],
-                "search_queries": ["queue-aware gating transformer serving"],
-            },
-        }
-        vector_responses = [
-            [{"note": paper, "semantic_score": 0.9, "vector_rank": 1, "vector_index_backend": "fake"}],
-            [{"note": paper, "semantic_score": 0.1, "vector_rank": 1, "vector_index_backend": "fake"}],
-        ]
-
-        class FakeVectorIndex:
-            def search(self, _query_text, _notes, top_k):
-                return vector_responses.pop(0)
-
-        with patch.object(
-            agent,
-            "_prefetch_literature_for_hypotheses",
-            return_value={
-                "queries": ["duplicate query"],
-                "results_per_query": 1,
-                "query_count": 1,
-                "fetched_count": 1,
-                "local_corpus_size": 1,
-            },
-        ), patch.object(
-            agent.literature_service,
-            "local_corpus",
-            return_value=[paper],
-        ) as mocked_local, patch("app.agents.get_prior_art_vector_index", return_value=FakeVectorIndex()), patch(
-            "app.agents.lexical_similarity_score",
-            return_value=0.0,
-        ), patch("app.agents.call_json", return_value=audit_payload) as mocked_call:
-            result = agent.check_hypotheses([hypothesis], goal, context)
-
-        self.assertEqual(result.data["repaired_count"], 1)
-        self.assertEqual(result.data["rejected_count"], 0)
-        self.assertTrue(hypothesis.is_active)
-        self.assertEqual(hypothesis.title, "Queue-Aware Gap Idea")
-        self.assertEqual(hypothesis.prior_art_repair_count, 1)
-        self.assertEqual(hypothesis.prior_art_signature, hypothesis.idea_signature())
-        self.assertEqual(hypothesis.prior_art_audit["novelty_risk"], "low")
-        self.assertEqual(mocked_local.call_count, 1)
-        self.assertEqual(mocked_call.call_count, 1)
-        self.assertEqual(mocked_call.call_args.kwargs["profile"], "thinking")
-        self.assertEqual(mocked_call.call_args.kwargs["model"], "thinking-model")
-
-    def test_semantic_scholar_enabled_without_api_key(self):
-        service = LiteratureSearchService()
-        service.sources = {"semantic_scholar"}
-        service.semantic_scholar_tool.api_key = None
-
-        self.assertTrue(service._semantic_scholar_enabled())
-
-    def test_literature_search_selects_cited_recent_and_random_papers(self):
-        with TemporaryDirectory() as temp_dir:
-            service = LiteratureSearchService()
-            service.cache = LiteratureCache(str(Path(temp_dir) / "literature_cache.json"))
-            service.sources = set()
-            notes = [
-                {
-                    "source": "semantic_scholar",
-                    "semantic_scholar_id": f"S2-{index}",
-                    "title": f"Paper {index}",
-                    "published": published,
-                    "citation_count": citation_count,
-                }
-                for index, (published, citation_count) in enumerate(
-                    [
-                        ("2024-01-01", 5),
-                        ("2023-01-01", 50),
-                        ("2026-02-01", 7),
-                        ("2022-01-01", 40),
-                        ("2026-05-01", 1),
-                        ("2021-01-01", 3),
-                        ("2025-01-01", 2),
-                        ("2020-01-01", 100),
-                        ("2026-03-01", 20),
-                        ("2024-06-01", 30),
-                    ]
-                )
-            ]
-            service.cache.set("arxiv", "trajectory representation", notes)
-
-            with patch.object(service, "_search_live_source_batch", return_value=([], {}, {})) as mocked_batch:
-                sampled = service.search(["trajectory representation"], max_results=5, sample_seed="cycle-2")
-
-        titles = [note["title"] for note in sampled]
-        reasons = {note["title"]: note.get("selection_reason") for note in sampled}
-        self.assertEqual(mocked_batch.call_count, 1)
-        self.assertEqual(mocked_batch.call_args.args[0], ["trajectory representation"])
-        self.assertEqual(len(sampled), 5)
-        self.assertIn("Paper 7", titles)
-        self.assertIn("Paper 1", titles)
-        self.assertIn("Paper 4", titles)
-        self.assertIn("Paper 8", titles)
-        self.assertEqual(reasons["Paper 7"], "high_relevance_high_citation")
-        self.assertEqual(reasons["Paper 4"], "high_relevance_recent")
-        self.assertIn("exploratory_random", reasons.values())
-
-    def test_online_literature_search_bundles_plain_queries_with_or(self):
-        agent = GenerationAgent()
-
-        with patch.dict("app.agents.config", {"literature_or_terms_per_query": 3}, clear=False), patch.object(
-            agent.literature_service,
-            "search",
-            return_value=[],
-        ) as mocked_search:
-            agent._search_literature(
-                [
-                    "end-to-end model",
-                    "auto driving model",
-                    "behavior cloning",
-                    "fused kernel",
-                    "draft validation",
-                ],
-                max_results=5,
-                sample_seed="cycle-2",
-            )
-
-        bundled_queries = mocked_search.call_args.args[0]
-        self.assertEqual(mocked_search.call_args.kwargs["max_results"], 5)
-        self.assertEqual(mocked_search.call_args.kwargs["sample_seed"], "cycle-2")
-        self.assertEqual(len(bundled_queries), 2)
-        self.assertTrue(all(" OR " in query for query in bundled_queries))
-        self.assertTrue(any("end-to-end model" in query and "auto driving model" in query for query in bundled_queries))
-        self.assertTrue(any("fused kernel" in query and "draft validation" in query for query in bundled_queries))
 
     def test_literature_prompt_serializes_all_supplied_notes(self):
         notes = [
@@ -1938,8 +1424,8 @@ critic_llm:
                 "title": "Frontier Paper",
                 "summary": "s",
                 "citation": "c",
-                "source": "semantic_scholar",
-                "sources": ["semantic_scholar"],
+                "source": "opencode",
+                "sources": ["opencode"],
                 "published": "2026-05-01",
                 "year": 2026,
                 "venue": "TestConf",
@@ -2373,153 +1859,8 @@ critic_llm:
         self.assertEqual(result.data["active_after"], 4)
         self.assertEqual(len(context.get_active_hypotheses()), 4)
 
-    def test_literature_dedupe_merges_same_paper_from_multiple_sources(self):
-        notes = dedupe_notes(
-            [
-                {
-                    "source": "semantic_scholar",
-                    "semantic_scholar_id": "S2-1",
-                    "title": "Shared Paper",
-                    "doi": "10.123/shared",
-                    "authors": ["Ada"],
-                    "sources": ["semantic_scholar"],
-                },
-                {
-                    "source": "arxiv",
-                    "title": "Shared Paper",
-                    "doi": "10.123/shared",
-                    "arxiv_id": "2501.00001v2",
-                    "authors": ["Ada", "Turing"],
-                    "sources": ["arxiv"],
-                },
-            ]
-        )
 
-        self.assertEqual(len(notes), 1)
-        self.assertEqual(notes[0]["sources"], ["arxiv", "semantic_scholar"])
-        self.assertEqual(notes[0]["authors"], ["Ada", "Turing"])
-        self.assertEqual(notes[0]["arxiv_id"], "2501.00001v2")
 
-    def test_literature_service_queries_both_sources_and_cache(self):
-        class FakeSemanticScholar:
-            calls = 0
-
-            def search_papers(self, query, max_results=10):
-                self.calls += 1
-                return [
-                    {
-                        "semantic_scholar_id": "S2-1",
-                        "title": "Shared Paper",
-                        "abstract": "Semantic Scholar abstract",
-                        "authors": ["Ada"],
-                        "year": 2025,
-                        "venue": "TestConf",
-                        "doi": "10.123/shared",
-                        "arxiv_id": "2501.00001",
-                        "url": "https://semanticscholar.org/paper/S2-1",
-                        "citation_count": 17,
-                    }
-                ]
-
-        class FakeArxiv:
-            calls = 0
-
-            def search_papers(self, query, max_results=None, categories=None, sort_by="relevance"):
-                self.calls += 1
-                return [
-                    {
-                        "title": "Shared Paper",
-                        "abstract": "arXiv abstract",
-                        "authors": ["Ada", "Turing"],
-                        "published": "2025-01-01T00:00:00",
-                        "journal_ref": "",
-                        "doi": "10.123/shared",
-                        "arxiv_id": "2501.00001v1",
-                        "arxiv_url": "https://arxiv.org/abs/2501.00001",
-                        "pdf_url": "https://arxiv.org/pdf/2501.00001",
-                    }
-                ]
-
-        with TemporaryDirectory() as temp_dir:
-            service = LiteratureSearchService()
-            service.cache = LiteratureCache(f"{temp_dir}/literature_cache.json")
-            service.sources = {"semantic_scholar", "arxiv"}
-            service.semantic_scholar_tool = FakeSemanticScholar()
-            service.arxiv_tool = FakeArxiv()
-
-            first = service.search(["neural reasoning"], max_results=5)
-            second = service.search(["reasoning neural"], max_results=5)
-
-        self.assertEqual(service.semantic_scholar_tool.calls, 2)
-        self.assertEqual(service.arxiv_tool.calls, 2)
-        self.assertEqual(len(first), 1)
-        self.assertEqual(first[0]["sources"], ["arxiv", "semantic_scholar"])
-        self.assertEqual(first[0]["citation_count"], 17)
-        self.assertGreaterEqual(len(second), 1)
-
-    def test_prefetch_expands_partial_exact_query_cache_to_requested_size(self):
-        query = '"end-to-end model" OR "autonomous driving model"'
-        cached_paper = {
-            "source": "arxiv",
-            "arxiv_id": "2501.00001v1",
-            "title": "Cached Paper",
-            "abstract": "cached",
-        }
-
-        class FakeArxiv:
-            def __init__(self):
-                self.calls = 0
-
-            def search_papers(self, query, max_results=None, categories=None, sort_by="relevance"):
-                self.calls += 1
-                self.query = query
-                self.max_results = max_results
-                return [
-                    {
-                        "title": "New Paper A",
-                        "abstract": "new a",
-                        "authors": [],
-                        "published": "2026-01-01T00:00:00",
-                        "arxiv_id": "2601.00002v1",
-                        "arxiv_url": "https://arxiv.org/abs/2601.00002",
-                        "pdf_url": "https://arxiv.org/pdf/2601.00002",
-                    },
-                    {
-                        "title": "New Paper B",
-                        "abstract": "new b",
-                        "authors": [],
-                        "published": "2026-01-02T00:00:00",
-                        "arxiv_id": "2601.00003v1",
-                        "arxiv_url": "https://arxiv.org/abs/2601.00003",
-                        "pdf_url": "https://arxiv.org/pdf/2601.00003",
-                    },
-                    {
-                        "title": "New Paper C",
-                        "abstract": "new c",
-                        "authors": [],
-                        "published": "2026-01-03T00:00:00",
-                        "arxiv_id": "2601.00004v1",
-                        "arxiv_url": "https://arxiv.org/abs/2601.00004",
-                        "pdf_url": "https://arxiv.org/pdf/2601.00004",
-                    },
-                ]
-
-        with TemporaryDirectory() as temp_dir:
-            service = LiteratureSearchService()
-            service.cache = LiteratureCache(f"{temp_dir}/literature_cache.json")
-            service.sources = {"arxiv"}
-            service.arxiv_tool = FakeArxiv()
-            service.cache.set("arxiv", query, [cached_paper])
-
-            result = service.prefetch_corpus([query], results_per_query=3)
-            expanded_cache = service.cache.get("arxiv", query)
-
-        self.assertEqual(service.arxiv_tool.calls, 1)
-        self.assertEqual(service.arxiv_tool.query, query)
-        self.assertEqual(service.arxiv_tool.max_results, 3)
-        self.assertEqual(len(expanded_cache), 4)
-        self.assertEqual(result["query_count"], 1)
-        self.assertEqual(result["fetched_count"], 4)
 
     def test_extract_hypothesis_items_accepts_common_top_level_list_keys(self):
         payload = {
@@ -2546,210 +1887,12 @@ critic_llm:
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["title"], "Idea A")
 
-    def test_literature_service_uses_semantic_scholar_without_api_key(self):
-        class FakeSemanticScholar:
-            api_key = None
 
-            def __init__(self):
-                self.calls = 0
 
-            def search_papers(self, query, max_results=10):
-                self.calls += 1
-                return [
-                    {
-                        "semantic_scholar_id": "S2-1",
-                        "title": "Only Semantic Scholar Paper",
-                        "abstract": "Semantic Scholar abstract",
-                        "authors": ["Grace"],
-                        "year": 2025,
-                        "venue": "Test Venue",
-                        "published": "2025-01-01",
-                        "doi": "10.0000/example",
-                        "arxiv_id": "",
-                        "url": "https://semanticscholar.org/paper/S2-1",
-                        "pdf_url": "",
-                        "citation_count": 23,
-                    }
-                ]
 
-        class FakeArxiv:
-            def __init__(self):
-                self.calls = 0
 
-            def search_papers(self, query, max_results=None, categories=None, sort_by="relevance"):
-                self.calls += 1
-                return [
-                    {
-                        "title": "Only arXiv Paper",
-                        "abstract": "arXiv abstract",
-                        "authors": ["Ada"],
-                        "published": "2025-01-01T00:00:00",
-                        "journal_ref": "",
-                        "doi": None,
-                        "arxiv_id": "2501.00001v1",
-                        "arxiv_url": "https://arxiv.org/abs/2501.00001",
-                        "pdf_url": "https://arxiv.org/pdf/2501.00001",
-                    }
-                ]
 
-        with TemporaryDirectory() as temp_dir:
-            service = LiteratureSearchService()
-            service.cache = LiteratureCache(f"{temp_dir}/literature_cache.json")
-            service.sources = {"semantic_scholar", "arxiv"}
-            service.semantic_scholar_tool = FakeSemanticScholar()
-            service.arxiv_tool = FakeArxiv()
 
-            notes = service.search(["neural reasoning"], max_results=5)
-
-        self.assertEqual(service.semantic_scholar_tool.calls, 1)
-        self.assertEqual(service.arxiv_tool.calls, 1)
-        self.assertEqual(len(notes), 2)
-        self.assertIn(23, [note.get("citation_count") for note in notes])
-
-    def test_arxiv_429_retries_once_before_skipping_live_search(self):
-        with TemporaryDirectory() as temp_dir, patch.dict(
-            "app.tools.arxiv_search.config",
-            {
-                "arxiv_state_path": f"{temp_dir}/arxiv_state.json",
-                "arxiv_rate_limit_max_retries": 1,
-                "arxiv_rate_limit_retry_after_seconds": 0,
-            },
-            clear=False,
-        ):
-            tool = ArxivSearchTool(max_results=2)
-
-            with patch.object(tool.client, "results", side_effect=RuntimeError("HTTP 429 Too Many Requests")) as mocked_results, patch(
-                "app.tools.arxiv_search.time.sleep"
-            ) as mocked_sleep:
-                notes = tool.search_papers("kv cache")
-
-            self.assertEqual(notes, [])
-            self.assertGreater(tool._disabled_until, 0.0)
-            self.assertEqual(tool._consecutive_failures, 1)
-            self.assertEqual(mocked_results.call_count, 2)
-            mocked_sleep.assert_called_once_with(0.0)
-
-    def test_arxiv_query_translates_generic_or_phrases_to_field_syntax(self):
-        tool = ArxivSearchTool(max_results=2)
-        query = (
-            '"LoRA vision-language-action robot manipulation" OR '
-            '"in-context learning diffusion policy robot"'
-        )
-
-        translated = tool._arxiv_query(query)
-
-        self.assertIn("all:LoRA AND all:vision AND all:language AND all:action", translated)
-        self.assertIn("all:context AND all:learning AND all:diffusion", translated)
-        self.assertNotIn('"', translated)
-        self.assertNotIn("vision-language-action", translated)
-        self.assertEqual(tool._arxiv_query("au:Geoffrey Hinton"), "au:Geoffrey Hinton")
-
-    def test_semantic_scholar_query_removes_exact_phrase_punctuation(self):
-        tool = SemanticScholarSearchTool()
-
-        translated = tool._semantic_scholar_query(
-            '"LoRA vision-language-action robot manipulation" OR "diffusion-policy robot"'
-        )
-
-        self.assertEqual(
-            translated,
-            "LoRA vision language action robot manipulation | diffusion policy robot",
-        )
-
-    def test_arxiv_429_retry_can_recover_live_search(self):
-        with TemporaryDirectory() as temp_dir, patch.dict(
-            "app.tools.arxiv_search.config",
-            {
-                "arxiv_state_path": f"{temp_dir}/arxiv_state.json",
-                "arxiv_rate_limit_max_retries": 1,
-                "arxiv_rate_limit_retry_after_seconds": 0,
-            },
-            clear=False,
-        ):
-            tool = ArxivSearchTool(max_results=2)
-            formatted_paper = {"source": "arxiv", "title": "Recovered Paper", "arxiv_id": "2501.00001v1"}
-
-            with patch.object(
-                tool.client,
-                "results",
-                side_effect=[RuntimeError("HTTP 429 Too Many Requests"), [object()]],
-            ) as mocked_results, patch.object(tool, "_format_paper", return_value=formatted_paper), patch(
-                "app.tools.arxiv_search.time.sleep"
-            ) as mocked_sleep:
-                notes = tool.search_papers("kv cache")
-
-            self.assertEqual(notes, [formatted_paper])
-            self.assertEqual(tool._disabled_until, 0.0)
-            self.assertEqual(tool._consecutive_failures, 0)
-            self.assertEqual(mocked_results.call_count, 2)
-            mocked_sleep.assert_called_once_with(0.0)
-
-    def test_semantic_scholar_429_retries_once_before_skipping(self):
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                return False
-
-            def read(self):
-                return b'{"data":[{"paperId":"S2-1","title":"Recovered Paper"}]}'
-
-        rate_limit_error = urllib.error.HTTPError(
-            url="https://api.semanticscholar.org/graph/v1/paper/search",
-            code=429,
-            msg="Too Many Requests",
-            hdrs={},
-            fp=None,
-        )
-
-        with patch.dict(
-            "app.tools.semantic_scholar.config",
-            {
-                "semantic_scholar_max_retries": 1,
-                "semantic_scholar_retry_after_seconds": 0,
-                "semantic_scholar_min_delay_seconds": 0,
-            },
-            clear=False,
-        ):
-            tool = SemanticScholarSearchTool()
-
-            with patch(
-                "app.tools.semantic_scholar.urllib.request.urlopen",
-                side_effect=[rate_limit_error, FakeResponse()],
-            ) as mocked_urlopen, patch("app.tools.semantic_scholar.time.sleep") as mocked_sleep:
-                notes = tool.search_papers("kv cache", max_results=1)
-
-        self.assertEqual(notes[0]["semantic_scholar_id"], "S2-1")
-        self.assertEqual(mocked_urlopen.call_count, 2)
-        mocked_sleep.assert_called_once_with(0.0)
-
-    def test_arxiv_cooldown_persists_across_tool_instances(self):
-        with TemporaryDirectory() as temp_dir, patch.dict(
-            "app.tools.arxiv_search.config",
-            {
-                "arxiv_state_path": f"{temp_dir}/arxiv_state.json",
-                "arxiv_rate_limit_max_retries": 1,
-                "arxiv_rate_limit_retry_after_seconds": 0,
-            },
-            clear=False,
-        ):
-            first = ArxivSearchTool(max_results=2)
-            with patch.object(first.client, "results", side_effect=RuntimeError("HTTP 429 Too Many Requests")), patch(
-                "app.tools.arxiv_search.time.sleep"
-            ):
-                first.search_papers("kv cache")
-
-            state_path = Path(temp_dir) / "arxiv_state.json"
-            self.assertTrue(state_path.exists())
-
-            second = ArxivSearchTool(max_results=2)
-            with patch.object(second.client, "results") as mocked_results:
-                notes = second.search_papers("speculative decoding")
-
-        self.assertEqual(notes, [])
-        self.assertGreater(second._disabled_until, 0.0)
-        mocked_results.assert_not_called()
 
 
 if __name__ == "__main__":

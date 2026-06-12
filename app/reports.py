@@ -147,22 +147,26 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
                 if latest_opencode.get("novelty_risks"):
                     parts.append(_line("OpenCode novelty risks:"))
                     parts.append(_format_list(latest_opencode.get("novelty_risks", [])[:4]))
-            prior_art_audit = hypothesis.get("prior_art_audit", {})
-            if isinstance(prior_art_audit, dict) and prior_art_audit:
-                parts.append(_line(f"Prior-art risk: `{prior_art_audit.get('novelty_risk', 'unknown')}`"))
-                if prior_art_audit.get("short_summary"):
-                    parts.append(_line(f"Prior-art summary: {prior_art_audit.get('short_summary')}"))
-                similar_papers = hypothesis.get("prior_art_similar_papers", [])
-                if similar_papers:
-                    parts.append(_line("Closest prior art:"))
-                    for paper in similar_papers[:3]:
+            literature_fetch_audit = hypothesis.get("literature_fetch_audit", {})
+            if isinstance(literature_fetch_audit, dict) and literature_fetch_audit:
+                parts.append(
+                    _line(
+                        f"OpenCode literature retrieval: status=`{literature_fetch_audit.get('status', 'unknown')}`, "
+                        f"papers=`{literature_fetch_audit.get('paper_count', 0)}`"
+                    )
+                )
+                if literature_fetch_audit.get("short_summary"):
+                    parts.append(_line(f"Literature summary: {literature_fetch_audit.get('short_summary')}"))
+                literature_notes = hypothesis.get("literature_notes", [])
+                if literature_notes:
+                    parts.append(_line("Related papers:"))
+                    for paper in literature_notes[:3]:
                         title = paper.get("title", "Untitled")
-                        score = paper.get("recall_score", "n/a")
                         url = paper.get("arxiv_url") or paper.get("url") or ""
                         if url:
-                            parts.append(_line(f"- [{title}]({url}) score={score}"))
+                            parts.append(_line(f"- [{title}]({url})"))
                         else:
-                            parts.append(_line(f"- {title} score={score}"))
+                            parts.append(_line(f"- {title}"))
             experiments = hypothesis.get("validation_experiments", [])
             if experiments:
                 parts.append(_line("Validation experiments:"))
@@ -195,7 +199,7 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
                     )
 
         parts.append(_line("### Generation Diagnostics"))
-        for step_name in ("generation", "prior_art_check", "evolution", "evolution_replacement_pruning", "prior_art_check_evolved"):
+        for step_name in ("generation", "idea_literature", "evolution", "evolution_replacement_pruning", "evolved_idea_literature"):
             step = cycle.get("steps", {}).get(step_name, {})
             if not step:
                 continue
@@ -206,13 +210,13 @@ def build_markdown_report(cycles: List[Dict[str, Any]]) -> str:
                         f"pruned={step.get('pruned_count', 0)}"
                     )
                 )
-            elif step_name.startswith("prior_art_check"):
+            elif step_name in {"idea_literature", "evolved_idea_literature"}:
                 parts.append(
                     _line(
                         f"- {step_name}: checked={step.get('checked_count', 0)}, "
                         f"skipped={step.get('skipped_count', 0)}, "
-                        f"repaired={step.get('repaired_count', 0)}, "
-                        f"rejected={step.get('rejected_count', 0)}"
+                        f"fetched={step.get('fetched_count', 0)}, "
+                        f"errors={step.get('error_count', 0)}"
                     )
                 )
             else:

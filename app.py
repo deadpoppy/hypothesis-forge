@@ -89,11 +89,7 @@ def _build_research_goal(args: argparse.Namespace, constraints: Dict[str, Any]) 
         elo_k_factor=args.elo_k_factor,
         top_k_hypotheses=args.top_k_hypotheses,
         max_literature_results=args.max_literature_results,
-        enable_prior_art_check=False if args.disable_prior_art_check else None,
-        prior_art_embedding_candidates=args.prior_art_embedding_candidates,
-        prior_art_review_top_k=args.prior_art_review_top_k,
-        prior_art_similarity_threshold=args.prior_art_similarity_threshold,
-        prior_art_repair_attempts=args.prior_art_repair_attempts,
+        enable_idea_literature=False if args.disable_idea_literature else None,
         ranking_matches_per_cycle=args.ranking_matches_per_cycle,
         proximity_similarity_threshold=args.proximity_similarity_threshold,
         hypothesis_decay_fraction=args.hypothesis_decay_fraction,
@@ -246,15 +242,11 @@ def run_cycles(args: argparse.Namespace) -> Dict[str, str]:
     _require_llm_api_key()
     research_goal = _build_research_goal(args, constraints)
     logger.info(
-        "Runtime concurrency controls: max_concurrency=%d embedding_concurrency=%s "
-        "sentence_transformer_device=%s "
-        "vector_batch_size=%s vector_backend=%s vector_search_chunk_size=%s",
+        "Runtime controls: max_concurrency=%d opencode_literature_timeout_seconds=%s "
+        "opencode_literature_max_papers=%s",
         research_goal.max_concurrency,
-        config.get("embedding_concurrency", 1),
-        config.get("sentence_transformer_device") or "auto",
-        config.get("prior_art_vector_batch_size", 64),
-        config.get("prior_art_vector_index_backend", "auto"),
-        config.get("prior_art_vector_search_chunk_size", 20000),
+        config.get("opencode_literature_timeout_seconds", 900),
+        config.get("opencode_literature_max_papers", research_goal.max_literature_results),
     )
     try:
         research_goal.reference_paper_context = prepare_reference_paper(
@@ -353,12 +345,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evolution-temperature", type=float, default=None, help="Temperature for evolved hypothesis generation.")
     parser.add_argument("--reflection-temperature", type=float, default=None, help="Temperature for review/ranking/meta-review.")
     parser.add_argument("--elo-k-factor", type=int, default=None, help="Elo K-factor for tournament ranking.")
-    parser.add_argument("--max-literature-results", type=int, default=None, help="Maximum literature notes to attach per search bundle.")
-    parser.add_argument("--disable-prior-art-check", action="store_true", help="Skip large-pool prior-art duplicate checking.")
-    parser.add_argument("--prior-art-embedding-candidates", type=int, default=None, help="Embedding/vector recall candidates scored before LLM prior-art audit.")
-    parser.add_argument("--prior-art-review-top-k", type=int, default=None, help="Top recalled prior-art papers sent to LLM audit.")
-    parser.add_argument("--prior-art-similarity-threshold", type=float, default=None, help="Minimum recall score before LLM duplicate audit.")
-    parser.add_argument("--prior-art-repair-attempts", type=int, default=None, help="Repair attempts allowed after a duplicate prior-art audit.")
+    parser.add_argument("--max-literature-results", type=int, default=None, help="Maximum OpenCode-retrieved papers retained per idea.")
+    parser.add_argument("--disable-idea-literature", action="store_true", help="Skip per-idea OpenCode literature retrieval.")
     parser.add_argument("--ranking-matches-per-cycle", type=int, default=None, help="Maximum pairwise ranking matches per ranking stage.")
     parser.add_argument("--proximity-similarity-threshold", type=float, default=None, help="Threshold for proximity clusters.")
     parser.add_argument(

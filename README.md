@@ -2,7 +2,7 @@
 
 ![Hypothesis Forge workflow](docs/assets/hypothesis-forge-overview.svg)
 
-Hypothesis Forge is a CLI-first research ideation engine inspired by the AI co-scientist workflow in [arXiv:2502.18864](https://arxiv.org/pdf/2502.18864). It turns a research goal plus a required reference arXiv paper into a structured plan, generates and evolves hypotheses over multiple cycles, grounds ideas with literature search, audits prior art, ranks candidates, and writes reviewable Markdown/JSON reports.
+Hypothesis Forge is a CLI-first research ideation engine inspired by the AI co-scientist workflow in [arXiv:2502.18864](https://arxiv.org/pdf/2502.18864). It turns a research goal plus a required reference arXiv paper into a structured plan, generates and evolves hypotheses over multiple cycles, fetches related papers once per idea through OpenCode, ranks candidates, and writes reviewable Markdown/JSON reports.
 
 The project is intentionally lightweight: it is built for local experimentation, reproducible idea sweeps, and quick inspection of how a pool of research hypotheses changes over time.
 
@@ -13,8 +13,8 @@ For agents: copy `config.example.yaml` to `config.yaml`, set `thinking_llm` and 
 - Builds a structured research plan from a plain-language goal and one required arXiv reference paper.
 - Generates fresh hypotheses and evolves high-scoring candidates across cycles.
 - Converts and summarizes the reference paper with the installed `arxiv2md` package before ideation.
-- Retrieves literature from Semantic Scholar and arXiv for grounding.
-- Runs larger-pool prior-art checks to catch duplicate or weakly differentiated ideas.
+- Fetches related papers once per idea with `opencode run --dangerously-skip-permissions`.
+- Reuses those per-idea papers for review, ranking context, evolution, and meta-review.
 - Reviews hypotheses with one consolidated critic pass and reranks the current top four ideas with `opencode run --dangerously-skip-permissions`.
 - Tracks trajectory quality, diversity, stability, and failure modes.
 - Saves timestamped reports plus live checkpoints for long runs.
@@ -48,9 +48,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The install includes `sentence-transformers` and `torch` because prior-art recall and hypothesis proximity scoring use semantic embedding similarity for the full workflow. `scikit-learn` and `numpy` are not listed directly because the repository code does not import them.
+The install includes `sentence-transformers` and `torch` because hypothesis deduplication and proximity scoring can use semantic embedding similarity. `scikit-learn` and `numpy` are not listed directly because the repository code does not import them.
 
-The top-four reranking stage also requires the `opencode` CLI to be installed and available on `PATH`.
+The per-idea paper fetch stage and top-four reranking stage require the `opencode` CLI to be installed and available on `PATH`.
 
 ## Configuration
 
@@ -79,7 +79,7 @@ critic_llm:
       model: "openai/gpt-4.1"
 ```
 
-`thinking_llm` handles planning, hypothesis generation, evolution, literature query planning, and prior-art repair. `critic_llm` handles safety checks, reflection, pairwise ranking, and meta-review. Each profile accepts one or more provider entries, and calls automatically move to the next configured entry if the current provider errors or is busy.
+`thinking_llm` handles planning, hypothesis generation, and evolution. `critic_llm` handles safety checks, reflection, pairwise ranking, and meta-review. Each profile accepts one or more provider entries, and calls automatically move to the next configured entry if the current provider errors or is busy.
 
 You can put keys in `config.yaml`, but environment variables are safer:
 
@@ -106,18 +106,9 @@ Semantic similarity is enabled by default:
 sentence_transformer_enabled: true
 sentence_transformer_model: "BAAI/bge-small-en-v1.5"
 sentence_transformer_local_files_only: false
-prior_art_include_cache_corpus: true
-cycle_literature_terms_per_idea: 6
-cycle_literature_shared_terms: 12
-cycle_literature_results_per_query: 1000
-literature_or_terms_per_query: 4
-prior_art_embedding_candidates: 200
-prior_art_vector_index_path: ".cache/prior_art_vector_index.npz"
-prior_art_vector_index_backend: "auto"
-prior_art_query_prefix: ""
 ```
 
-Prior-art recall now plans broad field/category search terms for the whole cycle's idea set, deduplicates all terms into one complete OR query, sends that query once to each paper source with a default limit of 1000 papers per source, writes every returned paper into the cache, and then reuses the local literature cache as the embedding corpus for per-idea checks. Other online literature grounding also bundles plain candidate terms before calling the paper sources. Query and paper embeddings use a compact `Title:` + `Abstract:` text format. The `auto` backend uses FAISS when it is installed and falls back to chunked numpy search otherwise. Keep `sentence_transformer_local_files_only: true` only after the configured embedding model is already cached locally.
+Paper grounding no longer calls Semantic Scholar, arXiv search, a local paper cache, or a vector index. Fresh generation does not search papers. After each new idea is created, the workflow calls `opencode run --dangerously-skip-permissions "<prompt>"` once for that idea and stores the returned paper notes on the hypothesis. Review uses that idea's notes, evolution reuses source ideas' notes as context, and evolved ideas then get their own one-shot OpenCode paper fetch.
 
 ## Quick Start
 
@@ -141,6 +132,8 @@ max_literature_results: 6
 max_concurrency: 16
 enable_opencode_reranking: true
 opencode_rerank_timeout_seconds: 900
+opencode_literature_timeout_seconds: 900
+opencode_literature_max_papers: 6
 ```
 
 You can override any of these from the CLI when needed:
@@ -221,14 +214,13 @@ python -m unittest discover -s tests
 ## Operational Notes
 
 - The required reference paper is converted through the installed `arxiv2md` package, then summarized by the thinking LLM before the workflow starts.
-- Top-four reranking calls OpenCode as `opencode run --dangerously-skip-permissions "<prompt>"`; set `enable_opencode_reranking: false` only for smoke tests without the OpenCode CLI.
-- arXiv `429` responses trigger a cooldown saved at `arxiv_state_path`.
+- Each new idea gets one OpenCode paper-fetch call as `opencode run --dangerously-skip-permissions "<prompt>"`; set `enable_idea_literature: false` or `--disable-idea-literature` only for smoke tests without the OpenCode CLI.
+- Top-four reranking also calls OpenCode, but its prompt uses already attached per-idea `literature_notes` and asks OpenCode not to run another paper search.
 - Reference paper conversion uses the `arxiv2md` package installed in the same
   Python environment that runs Hypothesis Forge. If conversion fails with an
   import error, install or expose that package in the active environment.
-- Semantic Scholar is optional. Without an API key, the workflow uses unauthenticated rate limits or continues with the remaining sources.
-- `sentence_transformer_local_files_only: true` requires the configured embedding model to already exist locally; otherwise vector recall falls back to direct lexical/embedding safeguards.
-- Set `max_literature_results: 0` for LLM-only smoke tests without live literature grounding.
+- `sentence_transformer_local_files_only: true` requires the configured embedding model to already exist locally; otherwise hypothesis similarity falls back to lexical safeguards.
+- Set `max_literature_results: 0` for LLM-only smoke tests without per-idea OpenCode paper grounding.
 
 ## Scope
 

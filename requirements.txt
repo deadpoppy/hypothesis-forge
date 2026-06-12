@@ -1,8 +1,5 @@
 openai
 pydantic
 PyYAML
-arxiv
-python-dateutil
-numpy
 sentence-transformers
 torch

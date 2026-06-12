@@ -6,8 +6,7 @@
 # experiment defaults that should not be committed.
 
 # LLM profiles
-# thinking_llm is used for planning, hypothesis generation, evolution, literature
-# query planning, and prior-art repair.
+# thinking_llm is used for planning, hypothesis generation, and evolution.
 thinking_llm:
   providers:
     - api_key: null
@@ -37,9 +36,9 @@ num_hypotheses: 5
 top_k_hypotheses: 3
 max_literature_results: 6
 ranking_matches_per_cycle: 1000
-# LLM, ranking, review, and online literature request concurrency.
+# LLM, ranking, review, and OpenCode request concurrency.
 max_concurrency: 16
-# Local SentenceTransformer encode concurrency. Keep this at 1 on low-memory hosts.
+# Local SentenceTransformer concurrency for hypothesis similarity.
 embedding_concurrency: 1
 
 # Scoring, review, reranking, and lifecycle controls
@@ -49,49 +48,21 @@ hypothesis_decay_fraction: 0.0
 enable_opencode_reranking: true
 opencode_rerank_timeout_seconds: 900
 enable_safety_review: true
-enable_prior_art_check: true
-# Prior-art prefetch builds one full-cycle OR query and fetches 1000 papers per source by default.
-cycle_literature_terms_per_idea: 6
-cycle_literature_shared_terms: 12
-cycle_literature_results_per_query: 1000
-literature_or_terms_per_query: 4
-prior_art_embedding_candidates: 200
-prior_art_review_top_k: 12
-prior_art_similarity_threshold: 0.38
-prior_art_repair_attempts: 1
-prior_art_include_cache_corpus: true
-prior_art_vector_index_path: ".cache/prior_art_vector_index.npz"
-prior_art_vector_index_backend: "numpy"
-prior_art_vector_batch_size: 2
-prior_art_vector_search_chunk_size: 4000
+# Fetch related papers once per idea through OpenCode.
+enable_idea_literature: true
+opencode_literature_timeout_seconds: 900
+opencode_literature_max_papers: 6
 
-# Literature grounding and cache
-literature_sources:
-  - semantic_scholar
-  - arxiv
-literature_cache_path: ".cache/literature_search_cache.json"
-arxiv_state_path: ".cache/arxiv_search_state.json"
-semantic_scholar_api_key: null
-semantic_scholar_timeout_seconds: 8
-semantic_scholar_min_delay_seconds: 2.0
-semantic_scholar_max_retries: 1
-semantic_scholar_retry_after_seconds: 20.0
-arxiv_rate_limit_max_retries: 1
-arxiv_rate_limit_retry_after_seconds: 20.0
-arxiv_failure_cooldown_seconds: 900
-arxiv_max_consecutive_failures: 3
-arxiv_max_terms_per_clause: 8
+# Required reference-paper conversion
 reference_arxiv_timeout_seconds: 180
 reference_markdown_char_limit: 24000
 
-# Semantic similarity model used for prior-art recall and hypothesis proximity.
+# Semantic similarity model used for hypothesis deduplication and proximity.
 sentence_transformer_enabled: true
 sentence_transformer_model: "BAAI/bge-small-en-v1.5"
 sentence_transformer_local_files_only: false
 # MPS has a much higher peak memory footprint for this workload.
 sentence_transformer_device: "cpu"
-prior_art_query_prefix: ""
-prior_art_document_prefix: ""
 
 # Temperature defaults by workflow stage.
 step_temperatures:

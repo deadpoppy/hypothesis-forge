@@ -7,9 +7,9 @@ from typing import Callable, Dict, List
 from .agents import (
     EvolutionAgent,
     GenerationAgent,
+    IdeaLiteratureAgent,
     MetaReviewAgent,
     OpenCodeRerankingAgent,
-    PriorArtAgent,
     ProximityAgent,
     RankingAgent,
     ReflectionAgent,
@@ -27,7 +27,7 @@ class SupervisorAgent:
         self.research_plan_agent = ResearchPlanAgent()
         self.safety_review_agent = SafetyReviewAgent()
         self.generation_agent = GenerationAgent()
-        self.prior_art_agent = PriorArtAgent()
+        self.idea_literature_agent = IdeaLiteratureAgent()
         self.reflection_agent = ReflectionAgent()
         self.proximity_agent = ProximityAgent()
         self.ranking_agent = RankingAgent()
@@ -91,14 +91,14 @@ class SupervisorAgent:
             context.add_hypothesis(hypothesis)
         emit_progress("generation")
 
-        prior_art_result = self.prior_art_agent.check_hypotheses(
+        idea_literature_result = self.idea_literature_agent.check_hypotheses(
             generation_result.hypotheses,
             research_goal,
             context,
-            step_name="prior_art_check",
+            step_name="idea_literature",
         )
-        self._add_step(cycle_details, prior_art_result)
-        emit_progress("prior_art_check")
+        self._add_step(cycle_details, idea_literature_result)
+        emit_progress("idea_literature")
 
         generation_review_candidates = [hypothesis for hypothesis in generation_result.hypotheses if hypothesis.is_active]
         review_result = self.reflection_agent.review_hypotheses(
@@ -145,14 +145,14 @@ class SupervisorAgent:
         self._add_step(cycle_details, replacement_pruning_result)
         emit_progress("evolution_replacement_pruning")
 
-        prior_art_evolved = self.prior_art_agent.check_hypotheses(
+        evolved_idea_literature = self.idea_literature_agent.check_hypotheses(
             evolution_result.hypotheses,
             research_goal,
             context,
-            step_name="prior_art_check_evolved",
+            step_name="evolved_idea_literature",
         )
-        self._add_step(cycle_details, prior_art_evolved)
-        emit_progress("prior_art_check_evolved")
+        self._add_step(cycle_details, evolved_idea_literature)
+        emit_progress("evolved_idea_literature")
 
         evolution_review_candidates = [hypothesis for hypothesis in evolution_result.hypotheses if hypothesis.is_active]
         review_evolved = self.reflection_agent.review_hypotheses(

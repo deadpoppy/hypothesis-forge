@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from .config import config
 from .llm import LLMCallError, call_json
-from .literature import dedupe_notes, get_literature_service
 from .models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan, StepResult
 from .prompts import (
     build_evolution_refill_messages,
@@ -20,10 +19,7 @@ from .prompts import (
     build_generation_refill_messages,
     build_generation_messages,
     build_goal_safety_review_messages,
-    build_cycle_literature_query_planning_messages,
-    build_literature_query_planning_messages,
     build_meta_review_messages,
-    build_prior_art_audit_messages,
     build_ranking_messages,
     build_ranking_reaudit_messages,
     build_research_plan_messages,
@@ -34,12 +30,10 @@ from .utils import (
     dedupe_preserve_order,
     generate_unique_id,
     generate_visjs_data,
-    lexical_similarity_score,
     logger,
     run_concurrently,
     similarity_score,
 )
-from .vector_index import get_prior_art_vector_index, paper_recall_text, title_abstract_recall_text
 
 
 def _compose_hypothesis_text(payload: Dict[str, Any]) -> str:
@@ -85,27 +79,68 @@ def _compose_hypothesis_text(payload: Dict[str, Any]) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def _hypothesis_recall_text(hypothesis: Hypothesis) -> str:
-    abstract = hypothesis.text.strip()
-    if not abstract:
-        abstract = " ".join(
-            part
-            for part in [
-                hypothesis.problem_framing,
-                hypothesis.central_insight,
-                hypothesis.mechanism,
-                hypothesis.rationale,
-            ]
-            if str(part).strip()
-        )
-    return title_abstract_recall_text(
-        hypothesis.title,
-        abstract,
-    )
-
-
 def _round_score(value: float) -> float:
     return round(float(value), 4)
+
+
+def _normalize_paper_title(title: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(title or "").casefold())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _paper_note_key(note: Dict[str, Any]) -> str:
+    doi = str(note.get("doi") or "").strip().casefold()
+    if doi:
+        return f"doi:{doi}"
+    arxiv_id = str(note.get("arxiv_id") or "").strip().casefold()
+    if arxiv_id:
+        normalized_arxiv_id = re.sub(r"v\d+$", "", arxiv_id)
+        return f"arxiv:{normalized_arxiv_id}"
+    url = str(note.get("url") or note.get("arxiv_url") or note.get("pdf_url") or "").strip().casefold()
+    if url:
+        return f"url:{url}"
+    title = _normalize_paper_title(str(note.get("title") or ""))
+    return f"title:{title}" if title else ""
+
+
+def dedupe_notes(notes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for note in notes:
+        if not isinstance(note, dict):
+            continue
+        key = _paper_note_key(note)
+        if not key:
+            continue
+        if key not in merged:
+            merged[key] = dict(note)
+            continue
+        existing = merged[key]
+        sources = dedupe_preserve_order(
+            coerce_string_list(existing.get("sources", []))
+            + coerce_string_list(note.get("sources", []))
+            + [str(existing.get("source") or ""), str(note.get("source") or "")]
+        )
+        existing["sources"] = [source for source in sources if source]
+        for field in (
+            "title",
+            "summary",
+            "abstract",
+            "authors",
+            "citation",
+            "published",
+            "year",
+            "venue",
+            "doi",
+            "arxiv_id",
+            "arxiv_url",
+            "url",
+            "pdf_url",
+            "relevance",
+            "novelty_risk",
+        ):
+            if not existing.get(field) and note.get(field):
+                existing[field] = note[field]
+    return list(merged.values())
 
 
 def _build_review_artifact(hypothesis: Hypothesis) -> Dict[str, Any]:
@@ -541,700 +576,60 @@ def _prioritize_diverse_hypotheses(
     return selected
 
 
-def _literature_budget_for_step(
-    research_goal: ResearchGoal,
-    trajectory_state: Dict[str, Any],
-    step_name: str,
-    iteration_number: int,
-) -> Tuple[int, int, List[str]]:
-    max_results = max(0, research_goal.max_literature_results)
-    if max_results <= 0:
-        return 0, 0, ["disabled"]
+def _parse_json_object_from_text(text: str) -> Dict[str, Any]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return {}
+    try:
+        payload = json.loads(stripped)
+        return payload if isinstance(payload, dict) else {}
+    except json.JSONDecodeError:
+        pass
 
-    query_budget = 3 if step_name == "generation" else 4
-    adjustments: List[str] = []
-    uncovered = coerce_string_list(trajectory_state.get("uncovered_focus_areas", []))
-    frontier_gaps = coerce_string_list(trajectory_state.get("frontier_focus_gaps", []))
-    overexplored = coerce_string_list(trajectory_state.get("overexplored_areas", []))
-
-    if step_name in {"generation", "evolution"} and iteration_number >= 2 and not uncovered and not frontier_gaps:
-        max_results = min(max_results, 3)
-        query_budget = min(query_budget, 2)
-        adjustments.append("mature_frontier_trim")
-    elif len(overexplored) >= 2:
-        max_results = min(max_results, 4)
-        query_budget = min(query_budget, 2 if step_name == "generation" else 3)
-        adjustments.append("cluster_trim")
-
-    return query_budget, max_results, adjustments
-
-
-def _focus_area_query_variants(text: str) -> List[str]:
-    raw = str(text or "").strip()
-    normalized = _normalize_focus_area(raw)
-    if not normalized:
-        return []
-
-    variants: List[str] = [raw]
-
-    if "kv cache reuse" in normalized or "cross token state sharing" in normalized:
-        variants.extend([
-            "kv cache reuse llm inference",
-            "prefix kv cache sharing transformer serving",
-        ])
-    elif "kv cache compression" in normalized or "memory layout optimization" in normalized:
-        variants.extend([
-            "kv cache compression llm inference",
-            "kv cache memory layout optimization transformer serving",
-        ])
-    elif "speculative decoding" in normalized or "verification acceleration" in normalized:
-        variants.extend([
-            "speculative decoding verification acceleration llm",
-            "training free speculative decoding transformer inference",
-        ])
-    elif "attention sparsity" in normalized or "token pruning" in normalized or "head skipping" in normalized:
-        variants.extend([
-            "attention sparsity token pruning llm inference",
-            "head skipping transformer decoding acceleration",
-        ])
-    elif "ffn sparsity" in normalized or "conditional computation" in normalized:
-        variants.extend([
-            "ffn sparsity transformer inference acceleration",
-            "conditional computation llm decoding",
-        ])
-    elif "early exit" in normalized or "layer skipping" in normalized or "adaptive depth" in normalized:
-        variants.extend([
-            "early exit llm inference acceleration",
-            "layer skipping autoregressive transformer decoding",
-        ])
-    elif "offloading" in normalized or "prefetching" in normalized or "bandwidth aware scheduling" in normalized:
-        variants.extend([
-            "kv cache offloading prefetching llm serving",
-            "bandwidth aware scheduling transformer inference",
-        ])
-    elif "hardware software co design" in normalized or "kernel fusion" in normalized or "batching" in normalized:
-        variants.extend([
-            "kernel fusion llm inference serving",
-            "continuous batching transformer serving acceleration",
-        ])
-    elif "sequence level" in normalized or "chunk level parallel generation" in normalized:
-        variants.extend([
-            "chunk level parallel decoding llm",
-            "sequence level parallel generation transformer inference",
-        ])
-    elif "runtime routing" in normalized or "input adaptive inference control" in normalized:
-        variants.extend([
-            "runtime adaptive inference routing llm",
-            "input adaptive inference control transformer serving",
-        ])
-
-    compact = " ".join(token for token in normalized.split() if token not in {"or", "and", "via"})
-    if compact and compact != normalized:
-        variants.append(compact)
-
-    return dedupe_preserve_order(variants)
-
-
-def _round_robin_query_bundle(query_groups: Sequence[Sequence[str]], limit: int) -> List[str]:
-    if limit <= 0:
-        return []
-
-    groups = [list(group) for group in query_groups if group]
-    selected: List[str] = []
-    seen = set()
-    index = 0
-
-    while groups and len(selected) < limit:
-        if index >= len(groups):
-            index = 0
-        group = groups[index]
-        while group and group[0] in seen:
-            group.pop(0)
-        if not group:
-            groups.pop(index)
-            continue
-        query = group.pop(0)
-        if query not in seen:
-            selected.append(query)
-            seen.add(query)
-        index += 1
-
-    return selected
-
-
-class LiteratureMixin:
-    def __init__(self) -> None:
-        self.literature_service = get_literature_service()
-
-    def _search_literature(
-        self,
-        queries: Sequence[str],
-        max_results: int,
-        sample_seed: str | None = None,
-    ) -> List[Dict[str, Any]]:
-        bundled_queries = self._bundle_online_literature_queries(queries)
-        return self.literature_service.search(bundled_queries, max_results=max_results, sample_seed=sample_seed)
-
-    def _build_queries(self, research_goal: ResearchGoal, research_plan: ResearchPlan, hypothesis: Hypothesis | None = None) -> List[str]:
-        queries = []
-        if hypothesis is not None:
-            queries.extend(hypothesis.search_queries)
-            queries.append(hypothesis.title)
-            queries.extend(_focus_area_query_variants(hypothesis.focus_area))
-        queries.extend(research_plan.seed_queries)
-        queries.extend(research_goal.reference_seed_queries())
-        queries.append(research_goal.description)
-        return dedupe_preserve_order(queries)
-
-    def _plan_literature_queries(
-        self,
-        research_goal: ResearchGoal,
-        research_plan: ResearchPlan,
-        candidate_queries: Sequence[str],
-        step_name: str,
-        query_budget: int,
-        context: ContextMemory | None = None,
-        hypothesis: Hypothesis | None = None,
-        extra_search_context: Dict[str, Any] | None = None,
-    ) -> List[str]:
-        raw_queries = dedupe_preserve_order(candidate_queries)
-        if query_budget <= 0:
-            return []
-        if not raw_queries:
-            return []
-
-        search_context: Dict[str, Any] = {"step": step_name}
-        if research_goal.reference_paper_context:
-            search_context["reference_paper"] = {
-                "title": research_goal.reference_paper_context.get("title"),
-                "core_problem": research_goal.reference_paper_context.get("core_problem"),
-                "core_mechanism": research_goal.reference_paper_context.get("core_mechanism"),
-                "seed_queries": research_goal.reference_paper_context.get("seed_queries", [])[:6],
-            }
-        if context is not None:
-            search_context["iteration_number"] = context.iteration_number
-            search_context["latest_meta_review"] = context.latest_meta_review()
-        if hypothesis is not None:
-            search_context["hypothesis"] = hypothesis.compact_summary()
-        if extra_search_context:
-            search_context.update(extra_search_context)
-
+    code_block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL)
+    if code_block:
         try:
-            payload = _coerce_mapping(
-                call_json(
-                    build_literature_query_planning_messages(
-                        research_goal=research_goal.prompt_context(),
-                        research_plan=research_plan.to_dict(),
-                        search_context=search_context,
-                        candidate_queries=raw_queries,
-                        max_queries=query_budget,
-                    ),
-                    model=research_goal.llm_model,
-                    temperature=0.1,
-                    profile="thinking",
-                ),
-                {},
-            )
-        except LLMCallError as exc:
-            logger.warning("Literature query planning failed for %s: %s", step_name, exc)
-            return raw_queries[:query_budget]
+            payload = json.loads(code_block.group(1))
+            return payload if isinstance(payload, dict) else {}
+        except json.JSONDecodeError:
+            pass
 
-        planned_queries = []
-        for item in payload.get("queries", []):
-            if isinstance(item, dict):
-                query = str(item.get("query") or "").strip()
-                keywords = coerce_string_list(item.get("keywords", []))
-                if not query and keywords:
-                    query = " OR ".join(f'"{keyword}"' if " " in keyword else keyword for keyword in keywords)
-            else:
-                query = str(item or "").strip()
-            if query:
-                planned_queries.append(query)
-
-        return dedupe_preserve_order(planned_queries + raw_queries)[:query_budget]
-
-    def _cycle_literature_idea_brief(self, hypothesis: Hypothesis) -> Dict[str, Any]:
-        return {
-            "idea_id": hypothesis.hypothesis_id,
-            "idea_title": hypothesis.title,
-            "focus_area": hypothesis.focus_area,
-            "primary_bottleneck": hypothesis.primary_bottleneck,
-            "summary": hypothesis.text or hypothesis.review_summary or hypothesis.title,
-            "search_queries": hypothesis.search_queries[:8],
-            "mechanism": hypothesis.mechanism,
-            "problem_framing": hypothesis.problem_framing,
-            "central_insight": hypothesis.central_insight,
-            "theoretical_story": hypothesis.theoretical_story,
-            "why_not_simple_combination": hypothesis.why_not_simple_combination,
-        }
-
-    def _normalize_search_terms(self, terms: Sequence[Any]) -> List[str]:
-        cleaned = []
-        for term in coerce_string_list(terms):
-            normalized = str(term).replace('"', "").strip()
-            normalized = normalized.strip("() ")
-            normalized = " ".join(normalized.split())
-            if normalized:
-                cleaned.append(normalized)
-        return dedupe_preserve_order(cleaned)
-
-    def _is_broad_literature_term(self, term: str) -> bool:
-        value = " ".join(str(term or "").split()).strip()
-        if not value or len(value) > 80:
-            return False
-        if re.search(r"[.!?;:]", value):
-            return False
-
-        words = re.findall(r"[A-Za-z0-9+#]+(?:[-/][A-Za-z0-9+#]+)?", value)
-        if not words or len(words) > 6:
-            return False
-
-        lower = value.casefold()
-        sentence_markers = {
-            "this",
-            "that",
-            "these",
-            "those",
-            "should",
-            "would",
-            "could",
-            "because",
-            "when",
-            "while",
-            "where",
-            "whether",
-        }
-        if any(marker in lower.split() for marker in sentence_markers):
-            return False
-
-        leading_verbs = {
-            "use",
-            "uses",
-            "using",
-            "route",
-            "routes",
-            "routing",
-            "verify",
-            "verifies",
-            "reduce",
-            "reduces",
-            "improve",
-            "improves",
-            "avoid",
-            "avoids",
-            "adapt",
-            "adapts",
-            "choose",
-            "chooses",
-            "combine",
-            "combines",
-            "predict",
-            "predicts",
-        }
-        first_word = words[0].casefold()
-        if first_word in leading_verbs and len(words) > 2:
-            return False
-
-        return True
-
-    def _normalize_broad_literature_terms(self, terms: Sequence[Any]) -> List[str]:
-        return [
-            term
-            for term in self._normalize_search_terms(terms)
-            if self._is_broad_literature_term(term)
-        ]
-
-    def _quote_search_term(self, term: str) -> str:
-        value = " ".join(str(term).replace('"', "").split())
-        if not value:
-            return ""
-        if value.startswith('"') and value.endswith('"'):
-            return value
-        if re.search(r"\s", value) or "/" in value or "-" in value:
-            return f'"{value}"'
-        return value
-
-    def _or_query(self, terms: Sequence[Any]) -> str:
-        cleaned = []
-        seen = set()
-        for term in self._normalize_search_terms(terms):
-            token = self._quote_search_term(term)
-            if not token:
-                continue
-            dedupe_key = token.casefold()
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            cleaned.append(token)
-        return " OR ".join(cleaned)
-
-    def _looks_like_boolean_query(self, query: str) -> bool:
-        return bool(re.search(r"\b(OR|AND|NOT)\b", str(query), flags=re.IGNORECASE))
-
-    def _boolean_or_terms(self, query: str) -> List[str]:
-        parts = re.split(r"\s+\bOR\b\s+", str(query), flags=re.IGNORECASE)
-        if len(parts) <= 1:
-            return []
-        return self._normalize_search_terms(parts)
-
-    def _bundle_online_literature_queries(self, queries: Sequence[str]) -> List[str]:
-        clean_queries = dedupe_preserve_order([str(item).strip() for item in queries if str(item).strip()])
-        if not clean_queries:
-            return []
-
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end > start:
         try:
-            terms_per_query = int(config.get("literature_or_terms_per_query", 4))
-        except (TypeError, ValueError):
-            terms_per_query = 4
-        terms_per_query = max(2, min(8, terms_per_query))
+            payload = json.loads(stripped[start : end + 1])
+            return payload if isinstance(payload, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
-        term_groups: List[List[str]] = []
-        plain_terms: List[str] = []
-        for query in clean_queries:
-            if self._looks_like_boolean_query(query):
-                boolean_terms = self._boolean_or_terms(query)
-                if boolean_terms:
-                    term_groups.append(boolean_terms)
-                else:
-                    plain_terms.append(query)
-            else:
-                plain_terms.append(query)
 
-        chunks = [
-            plain_terms[index : index + terms_per_query]
-            for index in range(0, len(plain_terms), terms_per_query)
-        ]
-        if len(chunks) > 1 and len(chunks[-1]) == 1:
-            chunks[-2].extend(chunks[-1])
-            chunks.pop()
-        term_groups.extend(chunks)
+def _opencode_literature_timeout() -> int:
+    timeout_value = config.get(
+        "opencode_literature_timeout_seconds",
+        config.get("opencode_rerank_timeout_seconds", 900),
+    )
+    try:
+        return max(1, int(timeout_value or 900))
+    except (TypeError, ValueError):
+        return 900
 
-        bundled = []
-        for group in term_groups:
-            for index in range(0, len(group), terms_per_query):
-                query = self._or_query(group[index : index + terms_per_query])
-                if query:
-                    bundled.append(query)
-        return dedupe_preserve_order(bundled)
 
-    def _build_default_cycle_literature_term_payload(
-        self,
-        research_goal: ResearchGoal,
-        research_plan: ResearchPlan,
-        hypotheses: Sequence[Hypothesis],
-    ) -> Dict[str, Any]:
-        idea_payload = []
-        for hypothesis in hypotheses:
-            fallback_terms = self._normalize_broad_literature_terms(
-                list(hypothesis.search_queries)
-                + [hypothesis.title, hypothesis.focus_area, hypothesis.primary_bottleneck]
-                + _focus_area_query_variants(hypothesis.focus_area)
-            )
-            idea_payload.append(
-                {
-                    "idea_id": hypothesis.hypothesis_id,
-                    "idea_title": hypothesis.title,
-                    "search_terms": fallback_terms[:6],
-                    "broader_terms": fallback_terms[6:10],
-                    "rationale": "fallback terms from the idea title, focus area, and stored search queries.",
-                }
-            )
+def _opencode_literature_max_papers(research_goal: ResearchGoal) -> int:
+    try:
+        goal_limit = max(0, int(research_goal.max_literature_results or 0))
+    except (TypeError, ValueError):
+        goal_limit = 0
+    if goal_limit <= 0:
+        return 0
 
-        shared_terms = self._normalize_broad_literature_terms(
-            list(research_plan.seed_queries)
-            + research_goal.reference_seed_queries()
-        )
-        return {
-            "ideas": idea_payload,
-            "shared_terms": shared_terms[:12],
-            "shared_broader_terms": shared_terms[12:20],
-            "notes": ["Fallback cycle term plan generated locally because the LLM planner was unavailable."],
-        }
-
-    def _plan_cycle_literature_terms(
-        self,
-        research_goal: ResearchGoal,
-        research_plan: ResearchPlan,
-        hypotheses: Sequence[Hypothesis],
-        context: ContextMemory,
-        step_name: str,
-    ) -> Dict[str, Any]:
-        fallback = self._build_default_cycle_literature_term_payload(research_goal, research_plan, hypotheses)
-        if not hypotheses:
-            return fallback
-
-        try:
-            max_terms_per_idea = int(config.get("cycle_literature_terms_per_idea", 6))
-        except (TypeError, ValueError):
-            max_terms_per_idea = 6
-        try:
-            max_shared_terms = int(config.get("cycle_literature_shared_terms", 12))
-        except (TypeError, ValueError):
-            max_shared_terms = 12
-        max_terms_per_idea = max(4, min(8, max_terms_per_idea))
-        max_shared_terms = max(6, min(16, max_shared_terms))
-        search_context: Dict[str, Any] = {
-            "step": step_name,
-            "iteration_number": context.iteration_number,
-            "latest_meta_review": context.latest_meta_review(),
-            "reference_paper": research_goal.reference_paper_context,
-            "hypotheses": [self._cycle_literature_idea_brief(hypothesis) for hypothesis in hypotheses],
-        }
-        try:
-            payload = _coerce_mapping(
-                call_json(
-                    build_cycle_literature_query_planning_messages(
-                        research_goal=research_goal.prompt_context(),
-                        research_plan=research_plan.to_dict(),
-                        ideas=[self._cycle_literature_idea_brief(hypothesis) for hypothesis in hypotheses],
-                        search_context=search_context,
-                        max_terms_per_idea=max_terms_per_idea,
-                        max_shared_terms=max_shared_terms,
-                    ),
-                    model=research_goal.llm_model,
-                    temperature=0.1,
-                    profile="thinking",
-                ),
-                fallback,
-            )
-        except LLMCallError as exc:
-            logger.warning("Cycle literature term planning failed for %s: %s", step_name, exc)
-            payload = fallback
-
-        ideas_payload = []
-        payload_ideas = payload.get("ideas", [])
-        if isinstance(payload_ideas, list):
-            for item in payload_ideas:
-                if not isinstance(item, dict):
-                    continue
-                idea_id = str(item.get("idea_id") or "").strip()
-                idea_title = str(item.get("idea_title") or "").strip()
-                search_terms = self._normalize_broad_literature_terms(item.get("search_terms") or item.get("terms") or [])
-                broader_terms = self._normalize_broad_literature_terms(item.get("broader_terms") or item.get("keywords") or [])
-                if not idea_id or not (search_terms or broader_terms):
-                    continue
-                ideas_payload.append(
-                    {
-                        "idea_id": idea_id,
-                        "idea_title": idea_title,
-                        "search_terms": search_terms,
-                        "broader_terms": broader_terms,
-                        "rationale": str(item.get("rationale") or "").strip(),
-                    }
-                )
-
-        known_ids = {item["idea_id"] for item in ideas_payload}
-        for hypothesis in hypotheses:
-            if hypothesis.hypothesis_id in known_ids:
-                continue
-            fallback_item = next(
-                (item for item in fallback["ideas"] if item.get("idea_id") == hypothesis.hypothesis_id),
-                None,
-            )
-            if not fallback_item:
-                continue
-            ideas_payload.append(
-                {
-                    "idea_id": hypothesis.hypothesis_id,
-                    "idea_title": hypothesis.title,
-                    "search_terms": self._normalize_broad_literature_terms(fallback_item.get("search_terms") or []),
-                    "broader_terms": self._normalize_broad_literature_terms(fallback_item.get("broader_terms") or []),
-                    "rationale": str(fallback_item.get("rationale") or "").strip(),
-                }
-            )
-
-        shared_terms = self._normalize_broad_literature_terms(payload.get("shared_terms") or [])
-        shared_broader_terms = self._normalize_broad_literature_terms(payload.get("shared_broader_terms") or [])
-        if not shared_terms and not shared_broader_terms:
-            shared_terms = self._normalize_broad_literature_terms(fallback.get("shared_terms", []))
-            shared_broader_terms = self._normalize_broad_literature_terms(fallback.get("shared_broader_terms", []))
-        notes = coerce_string_list(payload.get("notes", [])) or fallback.get("notes", [])
-        return {
-            "ideas": ideas_payload,
-            "shared_terms": shared_terms,
-            "shared_broader_terms": shared_broader_terms,
-            "notes": notes,
-        }
-
-    def _build_cycle_literature_query(
-        self,
-        term_payload: Dict[str, Any],
-        hypotheses: Sequence[Hypothesis],
-    ) -> str:
-        idea_payloads = term_payload.get("ideas", [])
-        payload_by_id = {
-            str(item.get("idea_id") or "").strip(): item
-            for item in idea_payloads
-            if isinstance(item, dict) and str(item.get("idea_id") or "").strip()
-        }
-
-        combined_terms: List[str] = []
-        for hypothesis in hypotheses:
-            payload = payload_by_id.get(hypothesis.hypothesis_id, {})
-            combined_terms.extend(
-                self._normalize_search_terms(
-                    list(payload.get("search_terms", []))
-                    + list(payload.get("broader_terms", []))
-                )
-            )
-        combined_terms.extend(
-            self._normalize_search_terms(
-                list(term_payload.get("shared_terms", []))
-                + list(term_payload.get("shared_broader_terms", []))
-            )
-        )
-        return self._or_query(combined_terms)
-
-    def _cycle_literature_result_limit(self) -> int:
-        try:
-            value = int(config.get("cycle_literature_results_per_query", 1000))
-        except (TypeError, ValueError):
-            value = 1000
-        return max(1000, value)
-
-    def _prefetch_literature_for_hypotheses(
-        self,
-        hypotheses: Sequence[Hypothesis],
-        research_goal: ResearchGoal,
-        context: ContextMemory,
-        step_name: str,
-    ) -> Dict[str, Any]:
-        candidates = [hypothesis for hypothesis in hypotheses if hypothesis.is_active]
-        research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
-        results_per_query = self._cycle_literature_result_limit()
-        if not candidates:
-            return {
-                "status": "skipped",
-                "reason": "no_active_hypotheses",
-                "query": "",
-                "queries": [],
-                "results_per_query": results_per_query,
-                "local_corpus_size": len(self.literature_service.local_corpus()),
-            }
-
-        term_payload = self._plan_cycle_literature_terms(
-            research_goal,
-            research_plan,
-            candidates,
-            context,
-            step_name=step_name,
-        )
-        planned_query = self._build_cycle_literature_query(
-            term_payload,
-            candidates,
-        )
-        planned_queries = [planned_query] if planned_query else []
-        logger.info(
-            "Cycle prior-art literature prefetch: ideas=%d query_count=%d results_per_query=%d term_count=%d",
-            len(candidates),
-            len(planned_queries),
-            results_per_query,
-            planned_query.count(" OR ") + 1 if planned_query else 0,
-        )
-
-        prefetch = self.literature_service.prefetch_corpus(
-            planned_queries,
-            results_per_query=results_per_query,
-        )
-        return {
-            "status": "prefetched",
-            "query": planned_query,
-            "results_per_query": results_per_query,
-            "candidate_count": len(candidates),
-            "term_plan": term_payload,
-            **prefetch,
-        }
-
-    def _local_literature_corpus(self) -> List[Dict[str, Any]]:
-        return self.literature_service.local_corpus()
-
-    def _recall_local_literature(
-        self,
-        query_text: str,
-        max_results: int,
-        selection_reason: str,
-    ) -> List[Dict[str, Any]]:
-        if max_results <= 0:
-            return []
-        corpus_notes = self._local_literature_corpus()
-        if not corpus_notes:
-            return []
-
-        candidate_limit = max(max_results * 4, max_results)
-        try:
-            vector_results = get_prior_art_vector_index().search(
-                query_text,
-                corpus_notes,
-                top_k=candidate_limit,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Local literature vector recall failed; falling back to lexical recall: %s", exc)
-            vector_results = self._lexical_local_literature_recall(query_text, corpus_notes, candidate_limit)
-
-        recalled: List[Dict[str, Any]] = []
-        for result in vector_results:
-            note = result.get("note", {})
-            if not isinstance(note, dict):
-                continue
-            annotated = dict(note)
-            annotated["selection_reason"] = selection_reason
-            annotated["semantic_score"] = _round_score(float(result.get("semantic_score", 0.0)))
-            if result.get("vector_rank") is not None:
-                annotated["vector_rank"] = result.get("vector_rank")
-            if result.get("vector_index_backend"):
-                annotated["vector_index_backend"] = result.get("vector_index_backend")
-            recalled.append(annotated)
-        return dedupe_notes(recalled)[:max_results]
-
-    def _recall_local_literature_for_hypothesis(
-        self,
-        hypothesis: Hypothesis,
-        max_results: int,
-        selection_reason: str,
-    ) -> List[Dict[str, Any]]:
-        return self._recall_local_literature(
-            _hypothesis_recall_text(hypothesis),
-            max_results=max_results,
-            selection_reason=selection_reason,
-        )
-
-    def _lexical_local_literature_recall(
-        self,
-        query_text: str,
-        corpus_notes: Sequence[Dict[str, Any]],
-        top_k: int,
-    ) -> List[Dict[str, Any]]:
-        scored = []
-        for note in dedupe_notes(corpus_notes):
-            score = lexical_similarity_score(query_text, paper_recall_text(note))
-            if score <= 0:
-                continue
-            scored.append(
-                {
-                    "note": note,
-                    "semantic_score": score,
-                    "vector_rank": None,
-                    "vector_index_backend": "lexical_fallback",
-                }
-            )
-        scored.sort(key=lambda item: item.get("semantic_score", 0.0), reverse=True)
-        for rank, item in enumerate(scored, start=1):
-            item["vector_rank"] = rank
-        return scored[:top_k]
-
-    def _literature_sample_seed(
-        self,
-        research_goal: ResearchGoal,
-        step_name: str,
-        context: ContextMemory | None = None,
-        hypothesis: Hypothesis | None = None,
-    ) -> str:
-        parts = [research_goal.signature(), step_name]
-        if context is not None:
-            parts.append(str(context.iteration_number))
-        if hypothesis is not None:
-            parts.append(hypothesis.hypothesis_id)
-        return "::".join(parts)
+    configured = config.get("opencode_literature_max_papers", goal_limit)
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        value = goal_limit
+    return min(goal_limit, max(0, value))
 
 
 class SafetyReviewAgent:
@@ -1327,10 +722,7 @@ class ResearchPlanAgent:
             return fallback
 
 
-class GenerationAgent(LiteratureMixin):
-    def __init__(self) -> None:
-        super().__init__()
-
+class GenerationAgent:
     def _payload_to_hypothesis(self, payload: Dict[str, Any], iteration: int) -> Hypothesis:
         title = str(payload.get("title") or payload.get("name") or payload.get("short_title") or "Untitled hypothesis").strip()
         return Hypothesis(
@@ -1366,7 +758,6 @@ class GenerationAgent(LiteratureMixin):
                 payload.get("test_plan") or payload.get("validation_experiments") or payload.get("experiments") or []
             ),
             references=dedupe_preserve_order(payload.get("references", [])),
-            search_queries=dedupe_preserve_order(payload.get("search_queries", [])),
             created_in_iteration=iteration,
         )
 
@@ -1381,31 +772,6 @@ class GenerationAgent(LiteratureMixin):
         preferred_focus_areas = dedupe_preserve_order(
             coverage["uncovered_focus_areas"] + coerce_string_list(trajectory_state.get("frontier_focus_gaps", []))
         )
-        query_budget, literature_max_results, literature_budget_adjustments = _literature_budget_for_step(
-            research_goal,
-            trajectory_state,
-            step_name="generation",
-            iteration_number=context.iteration_number,
-        )
-        coverage_queries = _round_robin_query_bundle(
-            [_focus_area_query_variants(area) for area in coverage["uncovered_focus_areas"]],
-            limit=query_budget,
-        )
-        base_queries = self._build_queries(research_goal, research_plan)
-        raw_literature_queries = dedupe_preserve_order(coverage_queries + base_queries)
-        literature_queries = self._plan_literature_queries(
-            research_goal,
-            research_plan,
-            raw_literature_queries,
-            step_name="generation",
-            query_budget=query_budget,
-            context=context,
-        )
-        literature_notes = self._search_literature(
-            literature_queries,
-            literature_max_results,
-            sample_seed=self._literature_sample_seed(research_goal, "generation", context),
-        )
         meta_feedback = context.latest_meta_review()
         research_overview = context.latest_research_overview()
         errors: List[str] = []
@@ -1416,7 +782,6 @@ class GenerationAgent(LiteratureMixin):
                     research_goal=research_goal.prompt_context(),
                     research_plan=research_plan.to_dict(),
                     context_hypotheses=context_memory,
-                    literature_notes=literature_notes,
                     meta_feedback=meta_feedback,
                     research_overview=research_overview,
                     trajectory_state=trajectory_state,
@@ -1444,7 +809,6 @@ class GenerationAgent(LiteratureMixin):
                 candidate.text = candidate.title
             if _is_duplicate_candidate(candidate, context, new_hypotheses):
                 continue
-            candidate.literature_notes = literature_notes
             new_hypotheses.append(candidate)
 
         refill_attempts = 0
@@ -1458,7 +822,6 @@ class GenerationAgent(LiteratureMixin):
                         research_goal=research_goal.prompt_context(),
                         research_plan=research_plan.to_dict(),
                         accepted_hypotheses=[hypothesis.compact_summary() for hypothesis in new_hypotheses],
-                        literature_notes=literature_notes,
                         meta_feedback=meta_feedback,
                         research_overview=research_overview,
                         trajectory_state=trajectory_state,
@@ -1487,7 +850,6 @@ class GenerationAgent(LiteratureMixin):
                     candidate.text = candidate.title
                 if _is_duplicate_candidate(candidate, context, new_hypotheses):
                     continue
-                candidate.literature_notes = literature_notes
                 new_hypotheses.append(candidate)
                 added_this_attempt += 1
 
@@ -1507,18 +869,11 @@ class GenerationAgent(LiteratureMixin):
             name="generation",
             hypotheses=new_hypotheses,
             data={
-                "literature": literature_notes,
-                "queries": literature_queries,
                 "temperature_used": generation_temperature,
                 "frontier_diversity": diversity_snapshot,
                 "trajectory_state": trajectory_state,
                 "uncovered_focus_areas": coverage["uncovered_focus_areas"],
                 "overexplored_areas": coverage["overexplored_areas"],
-                "literature_budget": {
-                    "query_budget": query_budget,
-                    "max_results": literature_max_results,
-                    "adjustments": literature_budget_adjustments,
-                },
                 "requested_hypotheses": research_goal.num_hypotheses,
                 "accepted_hypotheses": len(new_hypotheses),
                 "refill_attempts": refill_attempts,
@@ -1533,19 +888,16 @@ class GenerationAgent(LiteratureMixin):
         return _is_duplicate_candidate(candidate, context)
 
 
-class PriorArtAgent(LiteratureMixin):
-    def __init__(self) -> None:
-        super().__init__()
-
+class IdeaLiteratureAgent:
     def check_hypotheses(
         self,
         hypotheses: List[Hypothesis],
         research_goal: ResearchGoal,
         context: ContextMemory,
-        step_name: str = "prior_art_check",
+        step_name: str = "idea_literature",
     ) -> StepResult:
         start_time = time.time()
-        if not research_goal.enable_prior_art_check:
+        if not research_goal.enable_idea_literature:
             return StepResult(
                 name=step_name,
                 hypotheses=hypotheses,
@@ -1554,499 +906,259 @@ class PriorArtAgent(LiteratureMixin):
             )
 
         candidates = [hypothesis for hypothesis in hypotheses if hypothesis.is_active]
-        prefetch_candidates = [
-            hypothesis
-            for hypothesis in candidates
-            if not (hypothesis.prior_art_signature == hypothesis.idea_signature() and hypothesis.prior_art_audit)
-        ]
-        batch_prefetch = self._prefetch_literature_for_hypotheses(
-            prefetch_candidates,
-            research_goal,
-            context,
-            step_name=step_name,
-        )
-        local_corpus_notes = self._local_literature_corpus()
-        batch_queries = coerce_string_list(batch_prefetch.get("queries", []))
+        max_papers = _opencode_literature_max_papers(research_goal)
+        if max_papers <= 0:
+            return StepResult(
+                name=step_name,
+                hypotheses=hypotheses,
+                data={
+                    "status": "disabled",
+                    "reason": "max_literature_results_or_opencode_literature_max_papers_is_zero",
+                    "checked_count": 0,
+                    "skipped_count": len(hypotheses),
+                    "retrieval_mode": "opencode_per_idea_once",
+                },
+                duration=time.time() - start_time,
+            )
 
         def check_one(hypothesis: Hypothesis) -> Tuple[Hypothesis, Dict[str, Any], str | None]:
             try:
-                return hypothesis, self._check_one(
-                    hypothesis,
-                    research_goal,
-                    context,
-                    step_name,
-                    local_corpus_notes,
-                    batch_queries,
-                ), None
+                return hypothesis, self._fetch_one(hypothesis, research_goal, context, step_name, max_papers), None
             except Exception as exc:  # noqa: BLE001
-                return hypothesis, self._fallback_error_result(hypothesis, exc), f"{hypothesis.hypothesis_id}: {exc}"
+                return (
+                    hypothesis,
+                    {
+                        "status": "error",
+                        "paper_count": len(hypothesis.literature_notes),
+                        "short_summary": f"OpenCode literature retrieval failed: {exc}",
+                    },
+                    f"{hypothesis.hypothesis_id}: {exc}",
+                )
 
         errors: List[str] = []
         results = run_concurrently(candidates, check_one, max_workers=research_goal.max_concurrency)
         audits: Dict[str, Dict[str, Any]] = {}
+        papers_by_hypothesis: Dict[str, List[Dict[str, Any]]] = {}
         checked_count = 0
         skipped_count = max(0, len(hypotheses) - len(candidates))
-        repaired_count = 0
-        rejected_count = 0
-        kept_count = 0
+        fetched_count = 0
+        error_count = 0
 
         for hypothesis, audit, error in results:
             if error:
                 errors.append(error)
             audits[hypothesis.hypothesis_id] = audit
+            papers_by_hypothesis[hypothesis.hypothesis_id] = list(hypothesis.literature_notes)
             status = audit.get("status")
             if status == "skipped_unchanged":
                 skipped_count += 1
-            elif status == "repaired":
+            elif status in {"fetched", "empty"}:
                 checked_count += 1
-                repaired_count += 1
-                kept_count += 1
-            elif status == "rejected_duplicate":
-                checked_count += 1
-                rejected_count += 1
-            elif status in {"kept", "kept_low_recall", "error_fallback"}:
-                checked_count += 1
-                kept_count += 1
+                if status == "fetched":
+                    fetched_count += 1
+            elif status == "error":
+                error_count += 1
 
         return StepResult(
             name=step_name,
             hypotheses=hypotheses,
             data={
+                "status": "completed",
                 "audits": audits,
+                "papers_by_hypothesis": papers_by_hypothesis,
                 "checked_count": checked_count,
                 "skipped_count": skipped_count,
-                "kept_count": kept_count,
-                "repaired_count": repaired_count,
-                "rejected_count": rejected_count,
-                "query_count": batch_prefetch.get("query_count", 0),
-                "results_per_query": batch_prefetch.get("results_per_query", self._cycle_literature_result_limit()),
-                "embedding_candidates": research_goal.prior_art_embedding_candidates,
-                "retrieval_mode": "batch_prefetch_local_vector_index_embedding",
-                "review_top_k": research_goal.prior_art_review_top_k,
-                "similarity_threshold": research_goal.prior_art_similarity_threshold,
-                "local_corpus_size": len(local_corpus_notes),
-                "batch_prefetch": batch_prefetch,
+                "fetched_count": fetched_count,
+                "error_count": error_count,
+                "kept_count": checked_count + skipped_count,
+                "repaired_count": 0,
+                "rejected_count": 0,
+                "retrieval_mode": "opencode_per_idea_once",
+                "command": "opencode run --dangerously-skip-permissions",
+                "max_papers_per_idea": max_papers,
             },
             errors=errors,
             duration=time.time() - start_time,
         )
 
-    def _check_one(
+    def _fetch_one(
         self,
         hypothesis: Hypothesis,
         research_goal: ResearchGoal,
         context: ContextMemory,
         step_name: str,
-        local_corpus_notes: Sequence[Dict[str, Any]],
-        literature_queries: Sequence[str],
+        max_papers: int,
     ) -> Dict[str, Any]:
         current_signature = hypothesis.idea_signature()
-        if hypothesis.prior_art_signature == current_signature and hypothesis.prior_art_audit:
+        if hypothesis.literature_fetch_signature == current_signature and (
+            hypothesis.literature_notes
+            or hypothesis.literature_fetch_audit.get("method") == "opencode_per_idea_literature"
+        ):
             return {
                 "status": "skipped_unchanged",
-                "novelty_risk": hypothesis.prior_art_audit.get("novelty_risk", "unknown"),
-                "decision": hypothesis.prior_art_audit.get("decision", "cached"),
-                "short_summary": "Prior-art check skipped because the idea signature is unchanged.",
-                "similar_papers": hypothesis.prior_art_similar_papers,
+                "paper_count": len(hypothesis.literature_notes),
+                "short_summary": "OpenCode literature retrieval skipped because the idea signature is unchanged.",
+                "similar_papers": hypothesis.literature_notes,
             }
 
-        research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
-        repair_history: List[Dict[str, Any]] = []
-        attempt_number = 0
-        starting_repair_count = hypothesis.prior_art_repair_count
-
-        while True:
-            corpus_notes = list(local_corpus_notes)
-            similar_papers = self._rank_prior_art(hypothesis, corpus_notes, research_goal)
-            audit_papers = similar_papers[: research_goal.prior_art_review_top_k]
-            top_score = float(audit_papers[0].get("recall_score", 0.0)) if audit_papers else 0.0
-
-            if top_score < research_goal.prior_art_similarity_threshold:
-                audit_payload = self._low_recall_audit(top_score, literature_queries, len(corpus_notes))
-                self._record_prior_art_result(hypothesis, audit_payload, audit_papers, repair_history)
-                status = "repaired" if hypothesis.prior_art_repair_count > starting_repair_count else "kept_low_recall"
-                return {
-                    **audit_payload,
-                    "status": status,
-                    "queries": literature_queries,
-                    "corpus_size": len(corpus_notes),
-                    "similar_papers": audit_papers,
-                    "repair_history": repair_history,
-                }
-
-            try:
-                audit_payload = _coerce_mapping(
-                    call_json(
-                        build_prior_art_audit_messages(
-                            research_goal=research_goal.prompt_context(),
-                            research_plan=research_plan.to_dict(),
-                            hypothesis=hypothesis.to_dict(),
-                            similar_papers=audit_papers,
-                            attempt_number=attempt_number + 1,
-                        ),
-                        model=research_goal.llm_model,
-                        temperature=max(0.05, min(0.2, research_goal.reflection_temperature)),
-                        profile="thinking",
-                    ),
-                    {},
-                )
-                if not audit_payload:
-                    audit_payload = self._fallback_audit(top_score, audit_papers, RuntimeError("empty prior-art audit payload"))
-            except LLMCallError as exc:
-                audit_payload = self._fallback_audit(top_score, audit_papers, exc)
-
-            audit_payload = self._normalize_audit_payload(audit_payload, top_score, literature_queries, len(corpus_notes))
-            risk = audit_payload.get("novelty_risk", "medium")
-            decision = audit_payload.get("decision", "keep")
-            strong_duplicate = self._has_strong_duplicate(audit_payload)
-            duplicate_risk = risk == "high" or strong_duplicate or decision == "reject"
-
-            if decision == "repair" and attempt_number < research_goal.prior_art_repair_attempts:
-                changed = self._apply_repair(hypothesis, audit_payload.get("revised_hypothesis", {}))
-                repair_history.append(
-                    {
-                        "attempt": attempt_number + 1,
-                        "changed": changed,
-                        "novelty_risk": risk,
-                        "summary": audit_payload.get("short_summary", ""),
-                        "repair_strategy": audit_payload.get("repair_strategy", ""),
-                    }
-                )
-                if changed:
-                    hypothesis.prior_art_repair_count += 1
-                    attempt_number += 1
-                    continue
-                if duplicate_risk:
-                    self._reject_duplicate(hypothesis, audit_payload, audit_papers, repair_history)
-                    return {
-                        **audit_payload,
-                        "status": "rejected_duplicate",
-                        "queries": literature_queries,
-                        "corpus_size": len(corpus_notes),
-                        "similar_papers": audit_papers,
-                        "repair_history": repair_history,
-                    }
-
-            if duplicate_risk and decision != "keep":
-                self._reject_duplicate(hypothesis, audit_payload, audit_papers, repair_history)
-                return {
-                    **audit_payload,
-                    "status": "rejected_duplicate",
-                    "queries": literature_queries,
-                    "corpus_size": len(corpus_notes),
-                    "similar_papers": audit_papers,
-                    "repair_history": repair_history,
-                }
-
-            self._record_prior_art_result(hypothesis, audit_payload, audit_papers, repair_history)
-            status = "repaired" if hypothesis.prior_art_repair_count > starting_repair_count else "kept"
-            return {
-                **audit_payload,
-                "status": status,
-                "queries": literature_queries,
-                "corpus_size": len(corpus_notes),
-                "similar_papers": audit_papers,
-                "repair_history": repair_history,
-            }
-
-    def _rank_prior_art(
-        self,
-        hypothesis: Hypothesis,
-        corpus_notes: Sequence[Dict[str, Any]],
-        research_goal: ResearchGoal,
-    ) -> List[Dict[str, Any]]:
-        idea_text = self._idea_recall_text(hypothesis)
-        candidate_limit = max(research_goal.prior_art_embedding_candidates, research_goal.prior_art_review_top_k)
+        timeout = _opencode_literature_timeout()
+        prompt = self._build_opencode_literature_prompt(research_goal, context, hypothesis, max_papers)
+        command = ["opencode", "run", "--dangerously-skip-permissions", prompt]
+        raw_stdout = ""
+        raw_stderr = ""
+        errors: List[str] = []
+        payload: Dict[str, Any] = {}
         try:
-            vector_results = get_prior_art_vector_index().search(
-                idea_text,
-                corpus_notes,
-                top_k=candidate_limit,
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Prior-art vector recall failed; falling back to direct embedding scan: %s", exc)
-            vector_results = self._direct_embedding_rank(idea_text, corpus_notes, candidate_limit)
+            raw_stdout = completed.stdout or ""
+            raw_stderr = completed.stderr or ""
+            if completed.returncode != 0:
+                errors.append(f"opencode run exited with {completed.returncode}: {(raw_stderr or raw_stdout)[:1200]}")
+            else:
+                payload = _parse_json_object_from_text(raw_stdout)
+                if not payload:
+                    errors.append("opencode run returned no parseable JSON payload.")
+        except subprocess.TimeoutExpired as exc:
+            errors.append(f"opencode run timed out after {timeout}s: {exc}")
+        except OSError as exc:
+            errors.append(f"could not run opencode run: {exc}")
 
-        scored = []
-        for result in vector_results:
-            note = result.get("note", {})
-            if not isinstance(note, dict):
-                continue
-            paper_text = self._paper_recall_text(note)
-            lexical_score = max(
-                lexical_similarity_score(idea_text, paper_text),
-                lexical_similarity_score(hypothesis.title, str(note.get("title") or "")),
-            )
-            semantic_score = float(result.get("semantic_score", 0.0))
-            scored.append(
-                {
-                    **self._paper_for_audit(note),
-                    "lexical_score": _round_score(float(lexical_score)),
-                    "semantic_score": _round_score(float(semantic_score)),
-                    "recall_score": _round_score(semantic_score),
-                    "vector_rank": result.get("vector_rank"),
-                    "vector_index_backend": result.get("vector_index_backend"),
-                }
-            )
-
-        scored.sort(key=lambda item: item.get("recall_score", 0.0), reverse=True)
-        return scored
-
-    def _direct_embedding_rank(
-        self,
-        idea_text: str,
-        corpus_notes: Sequence[Dict[str, Any]],
-        candidate_limit: int,
-    ) -> List[Dict[str, Any]]:
-        scored = []
-        for note in dedupe_notes(corpus_notes):
-            paper_text = self._paper_recall_text(note)
-            semantic_score = similarity_score(idea_text, paper_text)
-            scored.append(
-                {
-                    "note": note,
-                    "semantic_score": semantic_score,
-                    "vector_rank": None,
-                    "vector_index_backend": "direct_scan",
-                }
-            )
-        scored.sort(key=lambda item: item.get("semantic_score", 0.0), reverse=True)
-        for rank, item in enumerate(scored, start=1):
-            item["vector_rank"] = rank
-        return scored[:candidate_limit]
-
-    def _idea_recall_text(self, hypothesis: Hypothesis) -> str:
-        return _hypothesis_recall_text(hypothesis)
-
-    def _paper_recall_text(self, note: Dict[str, Any]) -> str:
-        return paper_recall_text(note)
-
-    def _paper_for_audit(self, note: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "title": note.get("title"),
-            "summary": str(note.get("summary") or note.get("abstract") or "")[:900],
-            "citation": note.get("citation"),
-            "source": note.get("source"),
-            "sources": note.get("sources"),
-            "published": note.get("published"),
-            "year": note.get("year"),
-            "venue": note.get("venue"),
-            "citation_count": note.get("citation_count"),
-            "doi": note.get("doi"),
-            "arxiv_id": note.get("arxiv_id"),
-            "semantic_scholar_id": note.get("semantic_scholar_id"),
-            "arxiv_url": note.get("arxiv_url"),
-            "url": note.get("url"),
+        notes = self._normalize_literature_notes(payload, hypothesis, max_papers)
+        status = "fetched" if notes else "empty"
+        if errors and not notes:
+            status = "error"
+        hypothesis.literature_fetch_signature = current_signature
+        hypothesis.literature_notes = notes
+        search_summary = str(payload.get("search_summary") or payload.get("summary") or "").strip() if payload else ""
+        audit_payload = {
+            "status": status,
+            "method": "opencode_per_idea_literature",
+            "paper_count": len(notes),
+            "short_summary": search_summary or f"OpenCode returned {len(notes)} related papers for this idea.",
+            "search_terms": coerce_string_list(payload.get("search_terms", [])) if payload else [],
+            "errors": errors,
+            "stdout_tail": raw_stdout[-2000:],
+            "stderr_tail": raw_stderr[-2000:],
         }
+        hypothesis.literature_fetch_audit = audit_payload
+        if search_summary:
+            hypothesis.review_comments = dedupe_preserve_order(
+                hypothesis.review_comments + [f"{step_name}: {search_summary}"]
+            )
+        return audit_payload
 
-    def _normalize_audit_payload(
+    def _build_opencode_literature_prompt(
+        self,
+        research_goal: ResearchGoal,
+        context: ContextMemory,
+        hypothesis: Hypothesis,
+        max_papers: int,
+    ) -> str:
+        research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
+        payload = {
+            "task": "Find related academic papers for one research idea.",
+            "instructions": [
+                "Use your paper/web search ability once for this idea.",
+                "Return papers useful for novelty checking, evaluation, and future evolution of this exact idea.",
+                "Prefer real, citable papers. Include close prior art, relevant benchmarks, and adjacent methods.",
+                "Do not rank or reject the idea. Only provide concise paper metadata and why each paper matters.",
+                "Return strict JSON only, with no markdown or commentary outside JSON.",
+            ],
+            "research_goal": research_goal.prompt_context(),
+            "research_plan": research_plan.to_dict(),
+            "reference_paper": context.reference_paper_context or research_goal.reference_paper_context,
+            "idea": hypothesis.to_dict(),
+            "max_papers": max_papers,
+            "required_schema": {
+                "papers": [
+                    {
+                        "title": "string",
+                        "authors": ["string"],
+                        "year": "string",
+                        "venue": "string",
+                        "url": "string",
+                        "doi": "string",
+                        "arxiv_id": "string",
+                        "summary": "1-2 sentence description",
+                        "relevance": "why this paper matters for the idea",
+                        "novelty_risk": "low|medium|high|unknown",
+                    }
+                ],
+                "search_terms": ["string"],
+                "search_summary": "string",
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _normalize_literature_notes(
         self,
         payload: Dict[str, Any],
-        top_score: float,
-        queries: Sequence[str],
-        corpus_size: int,
-    ) -> Dict[str, Any]:
-        risk = str(payload.get("novelty_risk") or "").strip().lower()
-        if risk not in {"low", "medium", "high"}:
-            risk = "high" if top_score >= 0.78 else "medium"
-        decision = str(payload.get("decision") or "").strip().lower()
-        if decision not in {"keep", "repair", "reject"}:
-            decision = "reject" if risk == "high" else "keep"
-        normalized = dict(payload)
-        normalized["novelty_risk"] = risk
-        normalized["decision"] = decision
-        normalized["short_summary"] = str(payload.get("short_summary") or "").strip()
-        normalized["overlap_assessment"] = [
-            item for item in payload.get("overlap_assessment", []) if isinstance(item, dict)
-        ]
-        normalized["gap_analysis"] = coerce_string_list(payload.get("gap_analysis", []))
-        normalized["repair_strategy"] = str(payload.get("repair_strategy") or "").strip()
-        normalized["revised_hypothesis"] = _coerce_mapping(payload.get("revised_hypothesis"), {})
-        normalized["top_recall_score"] = _round_score(top_score)
-        normalized["queries"] = list(queries)
-        normalized["corpus_size"] = corpus_size
-        return normalized
+        hypothesis: Hypothesis,
+        max_papers: int,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict) or max_papers <= 0:
+            return []
+        raw_papers = (
+            payload.get("papers")
+            or payload.get("related_papers")
+            or payload.get("literature")
+            or payload.get("literature_notes")
+            or []
+        )
+        if not isinstance(raw_papers, list):
+            return []
 
-    def _low_recall_audit(self, top_score: float, queries: Sequence[str], corpus_size: int) -> Dict[str, Any]:
-        return {
-            "novelty_risk": "low",
-            "decision": "keep",
-            "short_summary": "No recalled paper cleared the prior-art audit threshold.",
-            "overlap_assessment": [],
-            "gap_analysis": [],
-            "repair_strategy": "",
-            "revised_hypothesis": {},
-            "top_recall_score": _round_score(top_score),
-            "queries": list(queries),
-            "corpus_size": corpus_size,
-        }
-
-    def _fallback_audit(
-        self,
-        top_score: float,
-        similar_papers: Sequence[Dict[str, Any]],
-        exc: Exception,
-    ) -> Dict[str, Any]:
-        return {
-            "novelty_risk": "medium" if top_score >= 0.6 else "low",
-            "decision": "keep",
-            "short_summary": f"Prior-art LLM audit failed; retained for downstream human/LLM review: {exc}",
-            "overlap_assessment": [
+        notes: List[Dict[str, Any]] = []
+        for item in raw_papers:
+            if isinstance(item, str):
+                paper = {"title": item}
+            elif isinstance(item, dict):
+                paper = item
+            else:
+                continue
+            title = str(paper.get("title") or paper.get("paper_title") or "").strip()
+            if not title:
+                continue
+            summary = str(paper.get("summary") or paper.get("abstract") or paper.get("description") or "").strip()
+            year = str(paper.get("year") or paper.get("published") or "").strip()
+            venue = str(paper.get("venue") or paper.get("journal") or paper.get("conference") or "").strip()
+            citation_parts = [title]
+            if year:
+                citation_parts.append(year)
+            if venue:
+                citation_parts.append(venue)
+            notes.append(
                 {
-                    "paper_title": paper.get("title", ""),
-                    "problem_overlap": "partial",
-                    "mechanism_overlap": "partial",
-                    "claim_overlap": "partial",
-                    "duplicate_level": "related",
-                    "rationale": "Automatic recall found this paper, but the audit call failed.",
+                    "source": "opencode",
+                    "sources": ["opencode"],
+                    "selection_reason": "opencode_per_idea_literature",
+                    "hypothesis_id": hypothesis.hypothesis_id,
+                    "title": title,
+                    "summary": summary,
+                    "abstract": str(paper.get("abstract") or summary),
+                    "authors": coerce_string_list(paper.get("authors", [])),
+                    "citation": " - ".join(citation_parts),
+                    "published": str(paper.get("published") or ""),
+                    "year": year,
+                    "venue": venue,
+                    "doi": str(paper.get("doi") or "").strip(),
+                    "arxiv_id": str(paper.get("arxiv_id") or "").strip(),
+                    "arxiv_url": str(paper.get("arxiv_url") or ""),
+                    "url": str(paper.get("url") or paper.get("arxiv_url") or paper.get("pdf_url") or "").strip(),
+                    "pdf_url": str(paper.get("pdf_url") or ""),
+                    "relevance": str(paper.get("relevance") or paper.get("why_relevant") or "").strip(),
+                    "novelty_risk": str(paper.get("novelty_risk") or "unknown").strip().lower(),
                 }
-                for paper in similar_papers[:3]
-            ],
-            "gap_analysis": ["Retry prior-art audit with a working LLM call."],
-            "repair_strategy": "",
-            "revised_hypothesis": {},
-            "top_recall_score": _round_score(top_score),
-        }
-
-    def _fallback_error_result(self, hypothesis: Hypothesis, exc: Exception) -> Dict[str, Any]:
-        audit_payload = {
-            "novelty_risk": "medium",
-            "decision": "keep",
-            "short_summary": f"Prior-art check failed before completion: {exc}",
-            "overlap_assessment": [],
-            "gap_analysis": ["Retry prior-art check before treating this idea as novel."],
-            "repair_strategy": "",
-            "revised_hypothesis": {},
-        }
-        self._record_prior_art_result(hypothesis, audit_payload, [], [])
-        return {**audit_payload, "status": "error_fallback", "similar_papers": []}
-
-    def _has_strong_duplicate(self, payload: Dict[str, Any]) -> bool:
-        for item in payload.get("overlap_assessment", []):
-            duplicate_level = str(item.get("duplicate_level") or "").strip().lower()
-            if duplicate_level == "strong":
-                return True
-            overlaps = [
-                str(item.get("problem_overlap") or "").strip().lower(),
-                str(item.get("mechanism_overlap") or "").strip().lower(),
-                str(item.get("claim_overlap") or "").strip().lower(),
-            ]
-            if overlaps.count("high") >= 2 and duplicate_level in {"medium", "strong"}:
-                return True
-        return False
-
-    def _apply_repair(self, hypothesis: Hypothesis, revised: Dict[str, Any]) -> bool:
-        if not isinstance(revised, dict) or not revised:
-            return False
-        before = hypothesis.idea_signature()
-        title = str(revised.get("title") or "").strip()
-        if title:
-            hypothesis.title = title
-        text = _compose_hypothesis_text(revised)
-        if text:
-            hypothesis.text = text
-        focus_area = str(revised.get("focus_area") or "").strip()
-        if focus_area:
-            hypothesis.focus_area = focus_area
-        primary_bottleneck = str(revised.get("primary_bottleneck") or "").strip()
-        if primary_bottleneck:
-            hypothesis.primary_bottleneck = primary_bottleneck
-        mechanism = str(revised.get("mechanism") or "").strip()
-        if mechanism:
-            hypothesis.mechanism = mechanism
-        problem_framing = str(revised.get("problem_framing") or revised.get("problem_frame") or "").strip()
-        if problem_framing:
-            hypothesis.problem_framing = problem_framing
-        central_insight = str(revised.get("central_insight") or revised.get("key_insight") or "").strip()
-        if central_insight:
-            hypothesis.central_insight = central_insight
-        theoretical_story = str(
-            revised.get("theoretical_story")
-            or revised.get("causal_story")
-            or revised.get("story")
-            or revised.get("storyline")
-            or ""
-        ).strip()
-        if theoretical_story:
-            hypothesis.theoretical_story = theoretical_story
-        anti_combination = str(
-            revised.get("why_not_simple_combination")
-            or revised.get("why_not_just_combination")
-            or revised.get("not_just_combination")
-            or ""
-        ).strip()
-        if anti_combination:
-            hypothesis.why_not_simple_combination = anti_combination
-        rationale = str(revised.get("novelty_rationale") or revised.get("rationale") or "").strip()
-        if rationale:
-            hypothesis.rationale = rationale
-        hypothesis.key_assumptions = dedupe_preserve_order(
-            hypothesis.key_assumptions + coerce_string_list(revised.get("key_assumptions") or revised.get("assumptions") or [])
-        )
-        hypothesis.predictions = dedupe_preserve_order(
-            coerce_string_list(revised.get("predictions", [])) or hypothesis.predictions
-        )
-        hypothesis.validation_experiments = dedupe_preserve_order(
-            coerce_string_list(revised.get("test_plan") or revised.get("validation_experiments") or []) or hypothesis.validation_experiments
-        )
-        hypothesis.search_queries = dedupe_preserve_order(
-            coerce_string_list(revised.get("search_queries", [])) + hypothesis.search_queries
-        )
-        hypothesis.review_comments = dedupe_preserve_order(
-            hypothesis.review_comments + ["prior_art_check: revised hypothesis around a literature gap."]
-        )
-        if hypothesis.origin == "evolution":
-            hypothesis.evolution_delta = " ".join(
-                part
-                for part in [
-                    hypothesis.evolution_delta,
-                    "Prior-art repair narrowed the mutation around a defensible gap.",
-                ]
-                if part
             )
-        return hypothesis.idea_signature() != before
+        return dedupe_notes(notes)[:max_papers]
 
-    def _record_prior_art_result(
-        self,
-        hypothesis: Hypothesis,
-        audit_payload: Dict[str, Any],
-        similar_papers: Sequence[Dict[str, Any]],
-        repair_history: Sequence[Dict[str, Any]],
-    ) -> None:
-        audit = dict(audit_payload)
-        audit["repair_history"] = list(repair_history)
-        hypothesis.prior_art_signature = hypothesis.idea_signature()
-        hypothesis.prior_art_audit = audit
-        hypothesis.prior_art_similar_papers = list(similar_papers)
-        hypothesis.literature_notes = dedupe_notes(hypothesis.literature_notes + list(similar_papers))[:20]
-        summary = str(audit.get("short_summary") or "").strip()
-        if summary:
-            hypothesis.review_comments = dedupe_preserve_order(
-                hypothesis.review_comments + [f"prior_art_check: {summary}"]
-            )
-
-    def _reject_duplicate(
-        self,
-        hypothesis: Hypothesis,
-        audit_payload: Dict[str, Any],
-        similar_papers: Sequence[Dict[str, Any]],
-        repair_history: Sequence[Dict[str, Any]],
-    ) -> None:
-        self._record_prior_art_result(hypothesis, audit_payload, similar_papers, repair_history)
-        hypothesis.is_active = False
-        hypothesis.review_verdict = "reject_prior_art_duplicate"
-        hypothesis.scores["novelty"] = min(hypothesis.scores.get("novelty", 5.0), 1.0)
-        hypothesis.failure_modes = dedupe_preserve_order(
-            hypothesis.failure_modes + ["High prior-art collision risk: core problem/mechanism/claim appears covered."]
-        )
-        hypothesis.improvement_actions = dedupe_preserve_order(
-            hypothesis.improvement_actions + ["Find a sharper literature gap or discard this idea."]
-        )
-
-
-class ReflectionAgent(LiteratureMixin):
-    def __init__(self) -> None:
-        super().__init__()
+class ReflectionAgent:
 
     def _seed_literature_for_review(
         self,
@@ -2056,16 +1168,7 @@ class ReflectionAgent(LiteratureMixin):
     ) -> List[Dict[str, Any]]:
         if max_results <= 0:
             return []
-
-        seeded_notes: List[Dict[str, Any]] = []
-        seeded_notes.extend(hypothesis.literature_notes)
-        for parent_id in hypothesis.parent_ids:
-            parent = context.hypotheses.get(parent_id)
-            if parent is None:
-                continue
-            seeded_notes.extend(parent.literature_notes)
-
-        return dedupe_notes(seeded_notes)[:max_results]
+        return dedupe_notes(hypothesis.literature_notes)[:max_results]
 
     def review_hypotheses(
         self,
@@ -2080,16 +1183,7 @@ class ReflectionAgent(LiteratureMixin):
         reference_paper = context.reference_paper_context or research_goal.reference_paper_context
 
         def review_one(hypothesis: Hypothesis) -> Tuple[Hypothesis, Dict[str, Any], List[Dict[str, Any]], str | None]:
-            seeded_notes = self._seed_literature_for_review(hypothesis, context, research_goal.max_literature_results)
-            remaining_slots = max(0, research_goal.max_literature_results - len(seeded_notes))
-            literature_notes = list(seeded_notes)
-            if remaining_slots > 0:
-                searched_notes = self._recall_local_literature_for_hypothesis(
-                    hypothesis,
-                    remaining_slots,
-                    selection_reason=f"{step_name}_local_embedding",
-                )
-                literature_notes = dedupe_notes(seeded_notes + searched_notes)[: research_goal.max_literature_results]
+            literature_notes = self._seed_literature_for_review(hypothesis, context, research_goal.max_literature_results)
 
             try:
                 payload = _coerce_mapping(call_json(
@@ -2966,7 +2060,7 @@ class OpenCodeRerankingAgent:
         payload = {
             "task": "Rerank the current top-four research ideas.",
             "instructions": [
-                "Use your paper search ability where useful before judging novelty and risks.",
+                "Use only the per-idea literature_notes already included in each candidate. Do not run another paper search.",
                 "Compare each idea against the user's goal and the required reference paper.",
                 "For every idea, store detailed critique: novelty risk, feasibility risk, evidence gap, and whether to keep it.",
                 "Prefer ideas that are inspired by the reference paper but do not copy its exact contribution.",
@@ -3115,10 +2209,7 @@ class OpenCodeRerankingAgent:
                 )
 
 
-class EvolutionAgent(LiteratureMixin):
-    def __init__(self) -> None:
-        super().__init__()
-
+class EvolutionAgent:
     def evolve_hypotheses(self, research_goal: ResearchGoal, context: ContextMemory) -> StepResult:
         start_time = time.time()
         research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
@@ -3155,35 +2246,11 @@ class EvolutionAgent(LiteratureMixin):
                 },
                 duration=time.time() - start_time,
             )
-        query_budget, literature_max_results, literature_budget_adjustments = _literature_budget_for_step(
-            research_goal,
-            trajectory_state,
-            step_name="evolution",
-            iteration_number=context.iteration_number,
-        )
-        coverage_queries = _round_robin_query_bundle(
-            [_focus_area_query_variants(area) for area in coverage["uncovered_focus_areas"]],
-            limit=query_budget,
-        )
-        raw_literature_queries = dedupe_preserve_order(
-            coverage_queries
-            + [hypothesis.title for hypothesis in source_hypotheses]
-            + research_plan.seed_queries
-            + [research_goal.description]
-        )
-        literature_queries = self._plan_literature_queries(
-            research_goal,
-            research_plan,
-            raw_literature_queries,
-            step_name="evolution",
-            query_budget=query_budget,
-            context=context,
-        )
-        literature_notes = self._search_literature(
-            literature_queries,
-            literature_max_results,
-            sample_seed=self._literature_sample_seed(research_goal, "evolution", context),
-        )
+        literature_notes = dedupe_notes(
+            note
+            for hypothesis in source_hypotheses
+            for note in hypothesis.literature_notes
+        )[: research_goal.max_literature_results]
         meta_feedback = context.latest_meta_review()
         research_overview = context.latest_research_overview()
         errors: List[str] = []
@@ -3287,14 +2354,12 @@ class EvolutionAgent(LiteratureMixin):
                     item.get("test_plan") or item.get("validation_experiments") or item.get("experiments") or []
                 ),
                 references=dedupe_preserve_order(item.get("references", [])),
-                search_queries=dedupe_preserve_order(item.get("search_queries", [])),
                 created_in_iteration=context.iteration_number + 1,
             )
             if not candidate.text:
                 candidate.text = candidate.title
             if _is_duplicate_candidate(candidate, context, evolved_hypotheses):
                 continue
-            candidate.literature_notes = literature_notes
             evolved_hypotheses.append(candidate)
 
         refill_attempts = 0
@@ -3375,14 +2440,12 @@ class EvolutionAgent(LiteratureMixin):
                         item.get("test_plan") or item.get("validation_experiments") or item.get("experiments") or []
                     ),
                     references=dedupe_preserve_order(item.get("references", [])),
-                    search_queries=dedupe_preserve_order(item.get("search_queries", [])),
                     created_in_iteration=context.iteration_number + 1,
                 )
                 if not candidate.text:
                     candidate.text = candidate.title
                 if _is_duplicate_candidate(candidate, context, evolved_hypotheses):
                     continue
-                candidate.literature_notes = literature_notes
                 evolved_hypotheses.append(candidate)
                 added_this_attempt += 1
 
@@ -3417,17 +2480,12 @@ class EvolutionAgent(LiteratureMixin):
                     "source_budget_adjustments": source_budget_adjustments,
                 },
                 "literature": literature_notes,
-                "queries": literature_queries,
                 "temperature_used": evolution_temperature,
                 "frontier_diversity": diversity_snapshot,
                 "trajectory_state": trajectory_state,
                 "uncovered_focus_areas": coverage["uncovered_focus_areas"],
                 "overexplored_areas": coverage["overexplored_areas"],
-                "literature_budget": {
-                    "query_budget": query_budget,
-                    "max_results": literature_max_results,
-                    "adjustments": literature_budget_adjustments,
-                },
+                "literature_mode": "reuse_source_idea_opencode_notes",
                 "requested_hypotheses": target_evolved_hypotheses,
                 "accepted_hypotheses": len(evolved_hypotheses),
                 "refill_attempts": refill_attempts,
@@ -3442,10 +2500,7 @@ class EvolutionAgent(LiteratureMixin):
         return _is_duplicate_candidate(candidate, context)
 
 
-class MetaReviewAgent(LiteratureMixin):
-    def __init__(self) -> None:
-        super().__init__()
-
+class MetaReviewAgent:
     def summarize_and_feedback(
         self,
         research_goal: ResearchGoal,
@@ -3463,29 +2518,7 @@ class MetaReviewAgent(LiteratureMixin):
             for hypothesis in ranked
             for note in hypothesis.literature_notes
         )[: research_goal.max_literature_results]
-        remaining_slots = max(0, research_goal.max_literature_results - len(seeded_notes))
-        literature_queries: List[str] = []
-        meta_recall_text = title_abstract_recall_text(
-            research_plan.objective or research_goal.description,
-            " ".join(
-                dedupe_preserve_order(
-                    list(research_plan.focus_areas)
-                    + list(research_plan.key_questions)
-                    + coerce_string_list(trajectory_state.get("frontier_focus_gaps", []))
-                    + coerce_string_list(trajectory_state.get("overexplored_areas", []))
-                )
-            ),
-        )
-        searched_notes = (
-            self._recall_local_literature(
-                meta_recall_text,
-                remaining_slots,
-                selection_reason="meta_review_local_embedding",
-            )
-            if remaining_slots > 0
-            else []
-        )
-        literature_notes = dedupe_notes(seeded_notes + searched_notes)[: research_goal.max_literature_results]
+        literature_notes = list(seeded_notes)
         errors: List[str] = []
 
         try:
@@ -3548,7 +2581,7 @@ class MetaReviewAgent(LiteratureMixin):
         return StepResult(
             name="meta_review",
             hypotheses=ranked[:3],
-            data={**context.latest_meta_review(), "literature_reuse_count": len(seeded_notes), "queries": literature_queries},
+            data={**context.latest_meta_review(), "literature_reuse_count": len(seeded_notes)},
             errors=errors,
             duration=time.time() - start_time,
         )

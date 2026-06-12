@@ -198,123 +198,10 @@ Required JSON schema:
     ]
 
 
-def build_literature_query_planning_messages(
-    research_goal: str,
-    research_plan: Dict[str, Any],
-    search_context: Dict[str, Any],
-    candidate_queries: List[str],
-    max_queries: int,
-) -> List[Dict[str, str]]:
-    prompt = f"""
-Construct academic literature search queries before live API search.
-The raw goal or hypothesis title may be too specific, so convert it into compact keyword bundles that can retrieve relevant prior work.
-
-Research goal:
-{research_goal}
-
-Research plan:
-{_json_block(research_plan)}
-
-Search context:
-{_json_block(search_context)}
-
-Candidate raw queries:
-{_json_block({"queries": candidate_queries})}
-
-Guidelines:
-- Produce at most {max_queries} queries.
-- Each query should combine 3 to 6 high-signal academic keywords or phrases with OR.
-- Prefer field vocabulary used in paper titles and abstracts, not full hypothesis prose.
-- Include synonyms and adjacent terms that broaden retrieval without drifting from the scientific objective.
-- Do not include markdown, explanations, or source-specific API syntax such as cat: filters.
-
-Required JSON schema:
-{{
-  "queries": [
-    {{
-      "query": "\"phrase one\" OR keyword OR \"phrase two\"",
-      "keywords": ["string"],
-      "rationale": "string"
-    }}
-  ]
-}}
-"""
-    return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt.strip()},
-    ]
-
-
-def build_cycle_literature_query_planning_messages(
-    research_goal: str,
-    research_plan: Dict[str, Any],
-    ideas: List[Dict[str, Any]],
-    search_context: Dict[str, Any],
-    max_terms_per_idea: int,
-    max_shared_terms: int,
-) -> List[Dict[str, str]]:
-    prompt = f"""
-Plan a high-recall literature sweep for the full cycle at once.
-Read every idea together and extract broad academic search vocabulary that retrieves relevant papers.
-The downstream system will deduplicate every returned phrase and combine all of them into exactly one complete OR query.
-Do not plan single-query searches one idea at a time.
-
-Research goal:
-{research_goal}
-
-Research plan:
-{_json_block(research_plan)}
-
-Cycle ideas:
-{_json_block({"ideas": ideas})}
-
-Search context:
-{_json_block(search_context)}
-
-Search budget:
-- Exactly one complete OR query will be sent to each literature source.
-- Prefer {max_terms_per_idea} or fewer search terms per idea.
-- Prefer up to {max_shared_terms} shared terms for the whole cycle.
-
-Guidelines:
-- Return field/category keywords: research areas, task names, benchmark names, method families, model families, and common title/abstract phrases.
-- Prefer broad terms that many relevant papers would actually use, such as "autonomous driving", "end-to-end driving", "behavior cloning", "speculative decoding", "LLM inference", or "kernel fusion".
-- Do not return full-sentence idea descriptions, detailed implementation claims, causal hypotheses, or niche phrases that only this generated idea would use.
-- Keep most terms to 2-5 words; use 1-word terms only for established names, and avoid terms longer than 6 words.
-- Think like an academic search expert: maximize recall, not elegance.
-- Use vocabulary that would appear in titles and abstracts.
-- Some terms may be shared across multiple ideas.
-- Avoid duplicate or near-duplicate terms.
-- Do not emit full boolean queries or split the terms into separate queries; the code will build the single OR query.
-- No markdown, no explanation outside the JSON schema.
-
-Required JSON schema:
-{{
-  "ideas": [
-    {{
-      "idea_id": "string",
-      "idea_title": "string",
-      "search_terms": ["string"],
-      "broader_terms": ["string"],
-      "rationale": "string"
-    }}
-  ],
-  "shared_terms": ["string"],
-  "shared_broader_terms": ["string"],
-  "notes": ["string"]
-}}
-"""
-    return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt.strip()},
-    ]
-
-
 def build_generation_messages(
     research_goal: str,
     research_plan: Dict[str, Any],
     context_hypotheses: List[Dict[str, Any]],
-    literature_notes: List[Dict[str, Any]],
     meta_feedback: Dict[str, Any],
     research_overview: Dict[str, Any],
     trajectory_state: Dict[str, Any],
@@ -324,7 +211,7 @@ def build_generation_messages(
 ) -> List[Dict[str, str]]:
     prompt = f"""
 Generate {num_hypotheses} new research hypotheses.
-Follow the shared research plan, use the literature as grounding, and use meta-review feedback to explore missing or weak areas.
+Follow the shared research plan and use meta-review feedback to explore missing or weak areas.
 
 Research goal:
 {research_goal}
@@ -334,9 +221,6 @@ Research plan:
 
 Current hypothesis memory:
 {_serialize_hypotheses(context_hypotheses)}
-
-Recent literature context:
-{_serialize_literature(literature_notes)}
 
 Recent meta-review feedback and research overview:
 {_serialize_feedback(meta_feedback, research_overview, trajectory_state)}
@@ -362,7 +246,7 @@ Requirements:
 - Before writing the JSON, internally assign each output slot to a different focus area or bottleneck so the batch is intentionally spread out.
 - If generating 4 or more hypotheses, cover at least 3 mechanism families unless the goal explicitly forbids it.
 - No single mechanism family should occupy more than half of the returned hypotheses unless there is overwhelming literature evidence that the family dominates the search space.
-- You may draw from multiple generation modes such as literature-grounded synthesis, debate-inspired proposals, decomposition into sub-hypotheses, or expansion into uncovered areas.
+- You may draw from multiple generation modes such as debate-inspired proposals, decomposition into sub-hypotheses, or expansion into uncovered areas.
 - Avoid ideas that directly duplicate the current hypothesis memory.
 - When undercovered focus areas are provided, cover as many of them as possible before revisiting crowded clusters.
 - Include the primary bottleneck for each idea such as compute, memory bandwidth, latency, cache pressure, or verification overhead.
@@ -387,12 +271,11 @@ Required JSON schema:
       "mechanism": "string",
       "why_not_simple_combination": "string",
       "novelty_rationale": "string",
-      "generation_strategy": "literature_grounding|debate|decomposition|expansion|other",
+      "generation_strategy": "debate|decomposition|expansion|other",
       "key_assumptions": ["string"],
       "predictions": ["string"],
       "test_plan": ["string"],
-      "references": ["string"],
-      "search_queries": ["string"]
+      "references": ["string"]
     }}
   ]
 }}
@@ -407,7 +290,6 @@ def build_generation_refill_messages(
     research_goal: str,
     research_plan: Dict[str, Any],
     accepted_hypotheses: List[Dict[str, Any]],
-    literature_notes: List[Dict[str, Any]],
     meta_feedback: Dict[str, Any],
     research_overview: Dict[str, Any],
     trajectory_state: Dict[str, Any],
@@ -427,9 +309,6 @@ Research plan:
 
 Already accepted hypotheses that must not be repeated:
 {_serialize_hypotheses(accepted_hypotheses)}
-
-Recent literature context:
-{_serialize_literature(literature_notes)}
 
 Recent meta-review feedback and research overview:
 {_serialize_feedback(meta_feedback, research_overview, trajectory_state)}
@@ -464,12 +343,11 @@ Required JSON schema:
       "mechanism": "string",
       "why_not_simple_combination": "string",
       "novelty_rationale": "string",
-      "generation_strategy": "literature_grounding|debate|decomposition|expansion|other",
+      "generation_strategy": "debate|decomposition|expansion|other",
       "key_assumptions": ["string"],
       "predictions": ["string"],
       "test_plan": ["string"],
-      "references": ["string"],
-      "search_queries": ["string"]
+      "references": ["string"]
     }}
   ]
 }}
@@ -542,82 +420,6 @@ Required JSON schema:
   "validation_experiments": ["string"],
   "improvement_actions": ["string"],
   "references": ["string"]
-}}
-"""
-    return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt.strip()},
-    ]
-
-
-def build_prior_art_audit_messages(
-    research_goal: str,
-    research_plan: Dict[str, Any],
-    hypothesis: Dict[str, Any],
-    similar_papers: List[Dict[str, Any]],
-    attempt_number: int,
-) -> List[Dict[str, str]]:
-    prompt = f"""
-Audit this hypothesis against recalled prior art.
-Use the papers as evidence, not as inspiration to copy. The goal is to distinguish true duplicate methods from normal related work.
-
-Research goal:
-{research_goal}
-
-Research plan:
-{_json_block(research_plan)}
-
-Hypothesis:
-{_json_block(hypothesis)}
-
-Recalled prior-art candidates:
-{_json_block({"papers": similar_papers})}
-
-Repair attempt number:
-{attempt_number}
-
-Decision policy:
-- A strong duplicate means the hypothesis overlaps the same problem, the same core mechanism, and substantially the same novelty claim as at least one paper.
-- A medium risk means the direction is close, but there is a plausible gap or materially different mechanism.
-- A low risk means the papers are background or adjacent work rather than duplicates.
-- If risk is high and a crisp gap exists, return decision "repair" and rewrite the hypothesis around that gap.
-- If risk is high and no defensible gap exists, return decision "reject".
-- If risk is low or medium, return decision "keep" unless a simple repair would materially improve novelty.
-- Do not call something duplicate only because it uses the same benchmark, model family, or broad problem setting.
-
-Required JSON schema:
-{{
-  "novelty_risk": "low|medium|high",
-  "decision": "keep|repair|reject",
-  "short_summary": "string",
-  "overlap_assessment": [
-    {{
-      "paper_title": "string",
-      "problem_overlap": "none|partial|high",
-      "mechanism_overlap": "none|partial|high",
-      "claim_overlap": "none|partial|high",
-      "duplicate_level": "none|related|medium|strong",
-      "rationale": "string"
-    }}
-  ],
-  "gap_analysis": ["string"],
-  "repair_strategy": "string",
-  "revised_hypothesis": {{
-    "title": "string",
-    "focus_area": "string",
-    "primary_bottleneck": "compute|memory bandwidth|latency|cache pressure|verification overhead|other",
-    "problem_framing": "string",
-    "central_insight": "string",
-    "theoretical_story": "string",
-    "core_hypothesis": "string",
-    "mechanism": "string",
-    "why_not_simple_combination": "string",
-    "novelty_rationale": "string",
-    "key_assumptions": ["string"],
-    "predictions": ["string"],
-    "test_plan": ["string"],
-    "search_queries": ["string"]
-  }}
 }}
 """
     return [
@@ -820,8 +622,7 @@ Required JSON schema:
       "key_assumptions": ["string"],
       "predictions": ["string"],
       "test_plan": ["string"],
-      "references": ["string"],
-      "search_queries": ["string"]
+      "references": ["string"]
     }}
   ]
 }}
@@ -907,8 +708,7 @@ Required JSON schema:
       "key_assumptions": ["string"],
       "predictions": ["string"],
       "test_plan": ["string"],
-      "references": ["string"],
-      "search_queries": ["string"]
+      "references": ["string"]
     }}
   ]
 }}

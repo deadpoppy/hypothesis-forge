@@ -152,11 +152,7 @@ class ResearchGoal:
     elo_k_factor: Optional[int] = None
     top_k_hypotheses: Optional[int] = None
     max_literature_results: Optional[int] = None
-    enable_prior_art_check: Optional[bool] = None
-    prior_art_embedding_candidates: Optional[int] = None
-    prior_art_review_top_k: Optional[int] = None
-    prior_art_similarity_threshold: Optional[float] = None
-    prior_art_repair_attempts: Optional[int] = None
+    enable_idea_literature: Optional[bool] = None
     ranking_matches_per_cycle: Optional[int] = None
     proximity_similarity_threshold: Optional[float] = None
     hypothesis_decay_fraction: Optional[float] = None
@@ -213,37 +209,10 @@ class ResearchGoal:
             default=5,
             minimum=0,
         )
-        if self.enable_prior_art_check is None:
-            self.enable_prior_art_check = bool(config.get("enable_prior_art_check", True))
+        if self.enable_idea_literature is None:
+            self.enable_idea_literature = bool(config.get("enable_idea_literature", True))
         else:
-            self.enable_prior_art_check = bool(self.enable_prior_art_check)
-        self.prior_art_embedding_candidates = _bounded_int(
-            self.prior_art_embedding_candidates
-            if self.prior_art_embedding_candidates is not None
-            else config.get("prior_art_embedding_candidates", 80),
-            default=80,
-        )
-        self.prior_art_review_top_k = _bounded_int(
-            self.prior_art_review_top_k
-            if self.prior_art_review_top_k is not None
-            else config.get("prior_art_review_top_k", 12),
-            default=12,
-        )
-        self.prior_art_similarity_threshold = _bounded_float(
-            self.prior_art_similarity_threshold
-            if self.prior_art_similarity_threshold is not None
-            else config.get("prior_art_similarity_threshold", 0.38),
-            default=0.38,
-            minimum=0.0,
-            maximum=1.0,
-        )
-        self.prior_art_repair_attempts = _bounded_int(
-            self.prior_art_repair_attempts
-            if self.prior_art_repair_attempts is not None
-            else config.get("prior_art_repair_attempts", 1),
-            default=1,
-            minimum=0,
-        )
+            self.enable_idea_literature = bool(self.enable_idea_literature)
         self.ranking_matches_per_cycle = _bounded_int(
             self.ranking_matches_per_cycle
             if self.ranking_matches_per_cycle is not None
@@ -290,11 +259,7 @@ class ResearchGoal:
                 str(self.elo_k_factor),
                 str(self.top_k_hypotheses),
                 str(self.max_literature_results),
-                str(self.enable_prior_art_check),
-                str(self.prior_art_embedding_candidates),
-                str(self.prior_art_review_top_k),
-                str(self.prior_art_similarity_threshold),
-                str(self.prior_art_repair_attempts),
+                str(self.enable_idea_literature),
                 str(self.ranking_matches_per_cycle),
                 str(self.proximity_similarity_threshold),
                 str(self.hypothesis_decay_fraction),
@@ -414,7 +379,7 @@ class ResearchPlan:
             avoid=avoid,
             preferred_evidence=_dedupe(preferred_evidence),
             seed_queries=_dedupe(seed_queries),
-            tool_preferences=["arxiv_search"],
+            tool_preferences=["opencode_literature"],
             notes=notes,
         )
 
@@ -491,7 +456,6 @@ class Hypothesis:
     supporting_observations: List[str] = field(default_factory=list)
     contradicting_observations: List[str] = field(default_factory=list)
     improvement_actions: List[str] = field(default_factory=list)
-    search_queries: List[str] = field(default_factory=list)
     novelty_review: Optional[str] = None
     feasibility_review: Optional[str] = None
     correctness_review: Optional[str] = None
@@ -503,10 +467,8 @@ class Hypothesis:
     review_comments: List[str] = field(default_factory=list)
     references: List[str] = field(default_factory=list)
     literature_notes: List[Dict[str, Any]] = field(default_factory=list)
-    prior_art_signature: Optional[str] = None
-    prior_art_audit: Dict[str, Any] = field(default_factory=dict)
-    prior_art_similar_papers: List[Dict[str, Any]] = field(default_factory=list)
-    prior_art_repair_count: int = 0
+    literature_fetch_signature: Optional[str] = None
+    literature_fetch_audit: Dict[str, Any] = field(default_factory=dict)
     debate_history: List[Dict[str, Any]] = field(default_factory=list)
     review_artifacts: List[Dict[str, Any]] = field(default_factory=list)
     opencode_rerank_reviews: List[Dict[str, Any]] = field(default_factory=list)
@@ -532,10 +494,6 @@ class Hypothesis:
             elo_score = float(data.get("elo_score", 1200.0))
         except (TypeError, ValueError):
             elo_score = 1200.0
-        try:
-            prior_art_repair_count = int(data.get("prior_art_repair_count", 0))
-        except (TypeError, ValueError):
-            prior_art_repair_count = 0
         try:
             created_in_iteration = int(data.get("created_in_iteration", 0))
         except (TypeError, ValueError):
@@ -565,7 +523,6 @@ class Hypothesis:
             supporting_observations=coerce_string_list(data.get("supporting_observations", [])),
             contradicting_observations=coerce_string_list(data.get("contradicting_observations", [])),
             improvement_actions=coerce_string_list(data.get("improvement_actions", [])),
-            search_queries=coerce_string_list(data.get("search_queries", [])),
             novelty_review=data.get("novelty_review"),
             feasibility_review=data.get("feasibility_review"),
             correctness_review=data.get("correctness_review"),
@@ -577,10 +534,8 @@ class Hypothesis:
             review_comments=coerce_string_list(data.get("review_comments", [])),
             references=coerce_string_list(data.get("references", [])),
             literature_notes=_dict_list(data.get("literature_notes")),
-            prior_art_signature=data.get("prior_art_signature"),
-            prior_art_audit=_mapping(data.get("prior_art_audit")),
-            prior_art_similar_papers=_dict_list(data.get("prior_art_similar_papers")),
-            prior_art_repair_count=prior_art_repair_count,
+            literature_fetch_signature=data.get("literature_fetch_signature"),
+            literature_fetch_audit=_mapping(data.get("literature_fetch_audit")),
             debate_history=_dict_list(data.get("debate_history")),
             review_artifacts=_dict_list(data.get("review_artifacts")),
             opencode_rerank_reviews=_dict_list(
@@ -744,7 +699,6 @@ class Hypothesis:
             "predictions": self.predictions,
             "key_assumptions": self.key_assumptions,
             "validation_experiments": self.validation_experiments,
-            "search_queries": self.search_queries,
         }
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -774,7 +728,6 @@ class Hypothesis:
             "supporting_observations": self.supporting_observations,
             "contradicting_observations": self.contradicting_observations,
             "improvement_actions": self.improvement_actions,
-            "search_queries": self.search_queries,
             "novelty_review": self.novelty_review,
             "feasibility_review": self.feasibility_review,
             "correctness_review": self.correctness_review,
@@ -786,10 +739,8 @@ class Hypothesis:
             "review_comments": self.review_comments,
             "references": self.references,
             "literature_notes": self.literature_notes,
-            "prior_art_signature": self.prior_art_signature,
-            "prior_art_audit": self.prior_art_audit,
-            "prior_art_similar_papers": self.prior_art_similar_papers,
-            "prior_art_repair_count": self.prior_art_repair_count,
+            "literature_fetch_signature": self.literature_fetch_signature,
+            "literature_fetch_audit": self.literature_fetch_audit,
             "debate_history": self.debate_history,
             "review_artifacts": self.review_artifacts,
             "opencode_rerank_reviews": self.opencode_rerank_reviews,
@@ -987,11 +938,7 @@ class ResearchGoalRequest(BaseModel):
     elo_k_factor: Optional[int] = None
     top_k_hypotheses: Optional[int] = None
     max_literature_results: Optional[int] = None
-    enable_prior_art_check: Optional[bool] = None
-    prior_art_embedding_candidates: Optional[int] = None
-    prior_art_review_top_k: Optional[int] = None
-    prior_art_similarity_threshold: Optional[float] = None
-    prior_art_repair_attempts: Optional[int] = None
+    enable_idea_literature: Optional[bool] = None
     ranking_matches_per_cycle: Optional[int] = None
     proximity_similarity_threshold: Optional[float] = None
     hypothesis_decay_fraction: Optional[float] = None
@@ -1021,45 +968,3 @@ class OverviewResponse(BaseModel):
     meta_review_critique: List[str]
     top_hypotheses: List[HypothesisResponse]
     suggested_next_steps: List[str]
-
-
-class ArxivSearchRequest(BaseModel):
-    query: str
-    max_results: Optional[int] = 10
-    categories: Optional[List[str]] = None
-    sort_by: Optional[str] = "relevance"
-    days_back: Optional[int] = None
-
-
-class ArxivPaper(BaseModel):
-    arxiv_id: str
-    entry_id: str
-    title: str
-    abstract: str
-    authors: List[str]
-    primary_category: str
-    categories: List[str]
-    published: Optional[str]
-    updated: Optional[str]
-    doi: Optional[str]
-    pdf_url: str
-    arxiv_url: str
-    comment: Optional[str]
-    journal_ref: Optional[str]
-    source: str = "arxiv"
-
-
-class ArxivSearchResponse(BaseModel):
-    query: str
-    total_results: int
-    papers: List[ArxivPaper]
-    search_time_ms: Optional[float]
-
-
-class ArxivTrendsResponse(BaseModel):
-    query: str
-    total_papers: int
-    date_range: str
-    top_categories: List[tuple]
-    top_authors: List[tuple]
-    papers: List[ArxivPaper]
