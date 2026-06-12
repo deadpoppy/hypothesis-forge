@@ -255,6 +255,7 @@ def _get_client(base_url: str | None, api_key: str) -> OpenAI:
             base_url=base_url,
             api_key=api_key,
             max_retries=0,
+            timeout=600,  # 10分钟超时
         )
         _clients[cache_key] = client
     return client
@@ -416,6 +417,7 @@ def call_llm(
                     model=provider.model,
                     messages=normalized_messages,
                     temperature=temperature,
+                    max_tokens=100000,
                 )
                 if completion.choices and completion.choices[0].message:
                     return completion.choices[0].message.content or ""
