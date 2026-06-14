@@ -32,7 +32,7 @@ import app.llm as llm_module
 import app.reference as reference_module
 from app.llm import LLMCallError, call_llm, extract_json_payload
 from app.models import ContextMemory, Hypothesis, ResearchGoal, ResearchPlan
-from app.prompts import _serialize_literature, build_evolution_messages, build_generation_messages, build_meta_review_messages
+from app.prompts import _serialize_literature, build_evolution_messages, build_generation_messages
 from app.reference import ReferencePaperError, normalize_arxiv_reference
 from app.reports import build_markdown_report
 from app.trajectory import analyze_run_payload
@@ -166,7 +166,7 @@ critic_llm:
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_context_memory_round_trips_from_saved_payload(self):
-        goal = ResearchGoal("resume goal", enable_safety_review=False)
+        goal = ResearchGoal("resume goal")
         context = ContextMemory()
         context.reset_for_goal(goal)
         context.research_plan = ResearchPlan.from_goal(goal)
@@ -196,7 +196,7 @@ critic_llm:
         self.assertEqual(restored.pairwise_decisions["H1::H2"]["winner_id"], "H1")
 
     def test_context_memory_migrates_legacy_codex_rerank_fields(self):
-        goal = ResearchGoal("resume goal", enable_safety_review=False)
+        goal = ResearchGoal("resume goal")
         payload = {
             "hypotheses": {
                 "H1": {
@@ -218,7 +218,7 @@ critic_llm:
 
     def test_resume_state_loads_matching_checkpoint_only(self):
         cli = _load_cli_module()
-        goal = ResearchGoal("resume goal", num_hypotheses=2, enable_safety_review=False)
+        goal = ResearchGoal("resume goal", num_hypotheses=2)
         context = ContextMemory()
         context.reset_for_goal(goal)
         context.research_plan = ResearchPlan.from_goal(goal)
@@ -238,7 +238,7 @@ critic_llm:
             (output_dir / "checkpoint_latest.json").write_text(json.dumps(payload), encoding="utf-8")
 
             state = cli._load_resume_state(str(output_dir), goal)
-            mismatch = cli._load_resume_state(str(output_dir), ResearchGoal("different goal", num_hypotheses=2, enable_safety_review=False))
+            mismatch = cli._load_resume_state(str(output_dir), ResearchGoal("different goal", num_hypotheses=2))
 
         self.assertIsNotNone(state)
         self.assertEqual(len(state["cycles"]), 1)
@@ -285,7 +285,6 @@ critic_llm:
                     temp_dir,
                     "--num-hypotheses",
                     "2",
-                    "--disable-safety-review",
                 ]
             )
             goal = cli._build_research_goal(args, {})
@@ -1120,20 +1119,24 @@ critic_llm:
         self.assertIn("simple combination", prompt)
 
     def test_meta_review_prompt_requests_story_guidance(self):
-        messages = build_meta_review_messages(
-            research_goal="goal",
-            research_plan={},
-            ranked_hypotheses=[],
+        goal = ResearchGoal("goal")
+        context = ContextMemory()
+        context.reset_for_goal(goal)
+        context.research_plan = ResearchPlan.from_goal(goal)
+        prompt = MetaReviewAgent()._build_opencode_meta_review_prompt(
+            research_goal=goal,
+            research_plan=context.research_plan,
+            context=context,
+            ranked=[],
             recent_reviews=[],
-            tournament_history=[],
-            proximity_summary={},
+            proximity_data={},
             trajectory_state={},
             literature_notes=[],
         )
-        prompt = messages[-1]["content"]
 
         self.assertIn("story_guidance", prompt)
-        self.assertIn("method-stacking patterns", prompt)
+        self.assertIn("method-stacking risk", prompt)
+        self.assertIn("method_stacking_patterns", prompt)
         self.assertIn("frontier_storyline", prompt)
 
     def test_unified_review_uses_only_the_ideas_opencode_literature(self):
@@ -1202,20 +1205,27 @@ critic_llm:
         )
         context.add_hypothesis(hypothesis)
 
-        with patch(
-            "app.agents.call_json",
-            return_value={
+        payload = {
                 "meta_review_critique": ["Keep going"],
                 "generation_guidance": ["Broaden"],
                 "reflection_guidance": ["Ground more"],
                 "ranking_guidance": ["Compare sharper"],
                 "research_overview": {"summary": "Overview"},
                 "expert_profiles": ["systems"],
-            },
+        }
+        with patch(
+            "app.agents.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["opencode"],
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            ),
         ):
             result = MetaReviewAgent().summarize_and_feedback(goal, context, {"clusters": [], "duplicate_candidates": []})
 
         self.assertEqual(result.data["literature_reuse_count"], 3)
+        self.assertEqual(result.data["meta_review_mode"], "opencode")
 
     def test_markdown_report_surfaces_story_fields(self):
         report = build_markdown_report(
@@ -1512,7 +1522,7 @@ critic_llm:
             def __init__(self):
                 self.calls = []
 
-            def create(self, model, messages, temperature):
+            def create(self, model, messages, temperature, **_kwargs):
                 self.calls.append(model)
                 if model == "primary-model":
                     raise RuntimeError("502 Bad Gateway")
@@ -1553,7 +1563,7 @@ critic_llm:
             def __init__(self):
                 self.calls = 0
 
-            def create(self, model, messages, temperature):
+            def create(self, model, messages, temperature, **_kwargs):
                 self.calls += 1
                 if self.calls < 4:
                     raise RuntimeError("502 Bad Gateway")
@@ -1598,7 +1608,7 @@ critic_llm:
             def __init__(self):
                 self.calls = []
 
-            def create(self, model, messages, temperature):
+            def create(self, model, messages, temperature, **_kwargs):
                 self.calls.append(
                     {
                         "model": model,
@@ -1611,10 +1621,11 @@ critic_llm:
         class FakeOpenAI:
             instances = []
 
-            def __init__(self, base_url, api_key, max_retries):
+            def __init__(self, base_url, api_key, max_retries, timeout=None):
                 self.base_url = base_url
                 self.api_key = api_key
                 self.max_retries = max_retries
+                self.timeout = timeout
                 self.chat = type("Chat", (), {"completions": FakeChatCompletions()})()
                 self.instances.append(self)
 
@@ -1664,7 +1675,7 @@ critic_llm:
             def __init__(self, owner):
                 self.owner = owner
 
-            def create(self, model, messages, temperature):
+            def create(self, model, messages, temperature, **_kwargs):
                 self.owner.calls.append((self.owner.base_url, self.owner.api_key, model))
                 if self.owner.base_url == "http://critic-a.test/v1":
                     raise RuntimeError("provider busy")
@@ -1673,10 +1684,11 @@ critic_llm:
         class FakeOpenAI:
             instances = []
 
-            def __init__(self, base_url, api_key, max_retries):
+            def __init__(self, base_url, api_key, max_retries, timeout=None):
                 self.base_url = base_url
                 self.api_key = api_key
                 self.max_retries = max_retries
+                self.timeout = timeout
                 self.calls = []
                 self.chat = type("Chat", (), {"completions": FakeChatCompletions(self)})()
                 self.instances.append(self)
@@ -1722,7 +1734,7 @@ critic_llm:
         self.assertGreater(score, 0.0)
 
     def test_supervisor_progress_callback_is_invoked(self):
-        goal = ResearchGoal("goal", enable_safety_review=False)
+        goal = ResearchGoal("goal")
         context = ContextMemory()
         context.reset_for_goal(goal)
         context.research_plan = ResearchPlan.from_goal(goal)
@@ -1748,7 +1760,7 @@ critic_llm:
         self.assertIn("cycle_complete", observed_steps)
 
     def test_frontier_decay_prunes_lowest_elo_active_hypotheses(self):
-        goal = ResearchGoal("goal", top_k_hypotheses=3, hypothesis_decay_fraction=0.25, enable_safety_review=False)
+        goal = ResearchGoal("goal", top_k_hypotheses=3, hypothesis_decay_fraction=0.25)
         context = ContextMemory()
         context.reset_for_goal(goal)
         for index in range(8):
@@ -1764,7 +1776,7 @@ critic_llm:
         self.assertEqual(context.hypotheses["H0"].review_verdict, "decayed_low_elo")
 
     def test_evolution_replacement_pruning_removes_one_old_idea_per_new_idea(self):
-        goal = ResearchGoal("goal", enable_safety_review=False)
+        goal = ResearchGoal("goal")
         context = ContextMemory()
         context.reset_for_goal(goal)
         old_hypotheses = [
@@ -1793,7 +1805,6 @@ critic_llm:
             "goal",
             reference_arxiv_url="https://arxiv.org/abs/2502.18864",
             reference_paper_context={"title": "Reference", "arxiv_url": "https://arxiv.org/abs/2502.18864"},
-            enable_safety_review=False,
         )
         context = ContextMemory()
         context.reset_for_goal(goal)
@@ -1802,50 +1813,49 @@ critic_llm:
             context.add_hypothesis(
                 Hypothesis(hypothesis_id, f"Idea {hypothesis_id}", "text", elo_score=1300 - index * 10)
             )
-        payload = {
-            "ranking": [
-                {"id": "H3", "rank": 1, "overall_score": 4.7, "summary": "Best differentiated idea."},
-                {"id": "H1", "rank": 2, "overall_score": 4.2},
-                {"id": "H2", "rank": 3, "overall_score": 3.8},
-                {"id": "H4", "rank": 4, "overall_score": 3.0},
-            ],
-            "evaluations": {
-                "H3": {
-                    "summary": "Strong but needs evidence.",
-                    "weaknesses": ["Needs a clearer baseline."],
-                    "novelty_risks": ["Adjacent to known routing work."],
-                    "feasibility_risks": ["May need costly experiments."],
-                    "recommended_action": "keep",
-                }
-            },
-            "overall_rationale": "H3 has the strongest gap.",
+        scores = {
+            "H1": 4.2,
+            "H2": 3.8,
+            "H3": 4.7,
+            "H4": 3.0,
         }
+
+        def fake_run(command, **_kwargs):
+            prompt_payload = json.loads(command[-1])
+            hypothesis_id = prompt_payload["candidate"]["id"]
+            payload = {
+                "id": hypothesis_id,
+                "overall_score": scores[hypothesis_id],
+                "summary": f"{hypothesis_id} calibrated review.",
+                "weaknesses": ["Needs a clearer baseline."] if hypothesis_id == "H3" else [],
+                "novelty_risks": ["Adjacent to known routing work."] if hypothesis_id == "H3" else [],
+                "feasibility_risks": ["May need costly experiments."] if hypothesis_id == "H3" else [],
+                "recommended_action": "keep",
+            }
+            return subprocess.CompletedProcess(args=["opencode"], returncode=0, stdout=json.dumps(payload), stderr="")
 
         with patch(
             "app.agents.subprocess.run",
-            return_value=subprocess.CompletedProcess(
-                args=["opencode"],
-                returncode=0,
-                stdout=json.dumps(payload),
-                stderr="",
-            ),
+            side_effect=fake_run,
         ) as mocked_run:
             result = OpenCodeRerankingAgent().rerank_top_hypotheses(goal, context)
 
         command = mocked_run.call_args.args[0]
+        self.assertEqual(mocked_run.call_count, 4)
         self.assertEqual(command[:3], ["opencode", "run", "--dangerously-skip-permissions"])
         self.assertEqual(len(command), 4)
-        self.assertIn("Rerank the current top-four research ideas.", command[-1])
+        self.assertIn("Independently review one candidate", command[-1])
         self.assertEqual(result.data["status"], "applied")
         self.assertEqual(result.data["command"], "opencode run --dangerously-skip-permissions")
+        self.assertEqual(result.data["parallel_review_count"], 4)
         self.assertEqual(context.get_ranked_hypotheses()[0].hypothesis_id, "H3")
         self.assertEqual(context.hypotheses["H3"].elo_score, 1300)
         self.assertEqual(context.hypotheses["H3"].opencode_rerank_reviews[-1]["rank"], 1)
         self.assertIn("Needs a clearer baseline.", context.hypotheses["H3"].review_comments)
-        self.assertEqual(context.opencode_rerank_history[-1]["overall_rationale"], "H3 has the strongest gap.")
+        self.assertIn("H3 ranked first by parallel OpenCode review", context.opencode_rerank_history[-1]["overall_rationale"])
 
     def test_frontier_decay_preserves_minimum_active_pool(self):
-        goal = ResearchGoal("goal", top_k_hypotheses=4, hypothesis_decay_fraction=0.75, enable_safety_review=False)
+        goal = ResearchGoal("goal", top_k_hypotheses=4, hypothesis_decay_fraction=0.75)
         context = ContextMemory()
         context.reset_for_goal(goal)
         for index in range(5):

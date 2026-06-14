@@ -41,7 +41,6 @@ _PROFILE_ALIASES = {
     "rank": "critic",
     "ranking": "critic",
     "meta_review": "critic",
-    "safety_review": "critic",
 }
 _PROFILE_LLM_SUFFIXES = (
     "api_key",

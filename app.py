@@ -93,7 +93,6 @@ def _build_research_goal(args: argparse.Namespace, constraints: Dict[str, Any]) 
         ranking_matches_per_cycle=args.ranking_matches_per_cycle,
         proximity_similarity_threshold=args.proximity_similarity_threshold,
         hypothesis_decay_fraction=args.hypothesis_decay_fraction,
-        enable_safety_review=False if args.disable_safety_review else None,
         max_concurrency=args.max_concurrency,
     )
 
@@ -356,7 +355,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fraction of the lowest-Elo active hypotheses to deactivate at the end of each cycle.",
     )
     parser.add_argument("--max-concurrency", type=int, default=None, help="Maximum concurrent LLM/tool calls for parallel-safe stages.")
-    parser.add_argument("--disable-safety-review", action="store_true", help="Skip automated research-goal safety review.")
     parser.add_argument(
         "--no-resume",
         action="store_true",

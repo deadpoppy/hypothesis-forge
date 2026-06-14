@@ -14,8 +14,8 @@ For agents: copy `config.example.yaml` to `config.yaml`, set `thinking_llm` and 
 - Generates fresh hypotheses and evolves high-scoring candidates across cycles.
 - Converts and summarizes the reference paper with the installed `arxiv2md` package before ideation.
 - Fetches related papers once per idea with `opencode run --dangerously-skip-permissions`.
-- Reuses those per-idea papers for review, ranking context, evolution, and meta-review.
-- Reviews hypotheses with one consolidated critic pass and reranks the current top four ideas with `opencode run --dangerously-skip-permissions`.
+- Reuses those per-idea papers for review, ranking context, evolution, and OpenCode meta-review.
+- Reviews hypotheses with one consolidated critic pass and reranks the current top four ideas with four parallel `opencode run --dangerously-skip-permissions` calls.
 - Tracks trajectory quality, diversity, stability, and failure modes.
 - Saves timestamped reports plus live checkpoints for long runs.
 
@@ -79,7 +79,7 @@ critic_llm:
       model: "openai/gpt-4.1"
 ```
 
-`thinking_llm` handles planning, hypothesis generation, and evolution. `critic_llm` handles safety checks, reflection, pairwise ranking, and meta-review. Each profile accepts one or more provider entries, and calls automatically move to the next configured entry if the current provider errors or is busy.
+`thinking_llm` handles planning, hypothesis generation, and evolution. `critic_llm` handles reflection and pairwise ranking. OpenCode handles per-idea literature retrieval, top-four reranking, and meta-review. Each LLM profile accepts one or more provider entries, and calls automatically move to the next configured entry if the current provider errors or is busy.
 
 You can put keys in `config.yaml`, but environment variables are safer:
 
@@ -132,6 +132,7 @@ max_literature_results: 6
 max_concurrency: 16
 enable_opencode_reranking: true
 opencode_rerank_timeout_seconds: 900
+opencode_meta_review_timeout_seconds: 900
 opencode_literature_timeout_seconds: 900
 opencode_literature_max_papers: 6
 ```
@@ -215,7 +216,7 @@ python -m unittest discover -s tests
 
 - The required reference paper is converted through the installed `arxiv2md` package, then summarized by the thinking LLM before the workflow starts.
 - Each new idea gets one OpenCode paper-fetch call as `opencode run --dangerously-skip-permissions "<prompt>"`; set `enable_idea_literature: false` or `--disable-idea-literature` only for smoke tests without the OpenCode CLI.
-- Top-four reranking also calls OpenCode, but its prompt uses already attached per-idea `literature_notes` and asks OpenCode not to run another paper search.
+- Top-four reranking calls OpenCode once per candidate in parallel, using already attached per-idea `literature_notes` and asking OpenCode not to run another paper search. Meta-review also uses OpenCode as a synthesis pass over the current hypotheses, reviews, rankings, and reused literature notes.
 - Reference paper conversion uses the `arxiv2md` package installed in the same
   Python environment that runs Hypothesis Forge. If conversion fails with an
   import error, install or expose that package in the active environment.

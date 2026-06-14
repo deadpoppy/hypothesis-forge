@@ -13,8 +13,8 @@ thinking_llm:
       base_url: "https://api.openai.com/v1"
       model: "gpt-4.1"
 
-# critic_llm is used for safety checks, reflection, pairwise ranking, and
-# meta-review. Add more providers in order; if one fails, the next is tried.
+# critic_llm is used for reflection and pairwise ranking. Add more providers
+# in order; if one fails, the next is tried.
 critic_llm:
   providers:
     - api_key: null
@@ -47,7 +47,7 @@ proximity_similarity_threshold: 0.55
 hypothesis_decay_fraction: 0.0
 enable_opencode_reranking: true
 opencode_rerank_timeout_seconds: 900
-enable_safety_review: true
+opencode_meta_review_timeout_seconds: 900
 # Fetch related papers once per idea through OpenCode.
 enable_idea_literature: true
 opencode_literature_timeout_seconds: 900

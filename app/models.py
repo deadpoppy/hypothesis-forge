@@ -156,7 +156,6 @@ class ResearchGoal:
     ranking_matches_per_cycle: Optional[int] = None
     proximity_similarity_threshold: Optional[float] = None
     hypothesis_decay_fraction: Optional[float] = None
-    enable_safety_review: Optional[bool] = None
     max_concurrency: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -235,10 +234,6 @@ class ResearchGoal:
             minimum=0.0,
             maximum=1.0,
         )
-        if self.enable_safety_review is None:
-            self.enable_safety_review = bool(config.get("enable_safety_review", True))
-        else:
-            self.enable_safety_review = bool(self.enable_safety_review)
         self.max_concurrency = _bounded_int(
             self.max_concurrency if self.max_concurrency is not None else config.get("max_concurrency", 8),
             default=8,
@@ -263,7 +258,6 @@ class ResearchGoal:
                 str(self.ranking_matches_per_cycle),
                 str(self.proximity_similarity_threshold),
                 str(self.hypothesis_decay_fraction),
-                str(self.enable_safety_review),
                 str(self.max_concurrency),
             ]
         )
@@ -942,7 +936,6 @@ class ResearchGoalRequest(BaseModel):
     ranking_matches_per_cycle: Optional[int] = None
     proximity_similarity_threshold: Optional[float] = None
     hypothesis_decay_fraction: Optional[float] = None
-    enable_safety_review: Optional[bool] = None
     max_concurrency: Optional[int] = None
 
 

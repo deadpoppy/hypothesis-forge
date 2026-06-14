@@ -18,8 +18,6 @@ from .prompts import (
     build_evolution_messages,
     build_generation_refill_messages,
     build_generation_messages,
-    build_goal_safety_review_messages,
-    build_meta_review_messages,
     build_ranking_messages,
     build_ranking_reaudit_messages,
     build_research_plan_messages,
@@ -630,78 +628,6 @@ def _opencode_literature_max_papers(research_goal: ResearchGoal) -> int:
     except (TypeError, ValueError):
         value = goal_limit
     return min(goal_limit, max(0, value))
-
-
-class SafetyReviewAgent:
-    def review_goal(self, research_goal: ResearchGoal) -> StepResult:
-        start_time = time.time()
-        errors: List[str] = []
-        try:
-            payload = _coerce_mapping(
-                call_json(
-                    build_goal_safety_review_messages(research_goal.prompt_context(), research_goal.constraints),
-                    model=research_goal.critic_llm_model,
-                    temperature=0.1,
-                    profile="critic",
-                ),
-                self._fallback_goal_review(research_goal),
-            )
-        except LLMCallError as exc:
-            payload = self._fallback_goal_review(research_goal)
-            errors.append(str(exc))
-
-        allowed = bool(payload.get("allowed", False))
-        decision = str(payload.get("decision", "block")).strip().lower()
-        if decision == "block":
-            allowed = False
-        payload["allowed"] = allowed
-        payload["decision"] = "allow" if allowed and decision not in {"allow_with_human_review", "block"} else decision
-        payload["reasons"] = coerce_string_list(payload.get("reasons", []))
-        payload["required_mitigations"] = coerce_string_list(payload.get("required_mitigations", []))
-
-        return StepResult(
-            name="goal_safety_review",
-            data=payload,
-            errors=errors,
-            duration=time.time() - start_time,
-        )
-
-    def _fallback_goal_review(self, research_goal: ResearchGoal) -> Dict[str, Any]:
-        goal = research_goal.description.casefold()
-        blocked_terms = [
-            "bioweapon",
-            "chemical weapon",
-            "pathogen",
-            "toxin",
-            "virulence",
-            "gain of function",
-            "malware",
-            "ransomware",
-            "phishing",
-            "武器",
-            "病原体",
-            "毒素",
-            "恶意软件",
-            "勒索",
-        ]
-        mitigating_terms = ["safety", "defense", "defensive", "detection", "mitigation", "安全", "防御", "检测", "缓解"]
-        has_blocked_signal = any(term in goal for term in blocked_terms)
-        has_mitigation = any(term in goal for term in mitigating_terms)
-        if has_blocked_signal and not has_mitigation:
-            return {
-                "allowed": False,
-                "risk_level": "blocked",
-                "decision": "block",
-                "reasons": ["Fallback safety heuristic detected potentially harmful dual-use intent."],
-                "required_mitigations": ["Reframe the task as defensive, analytical, or safety-focused under human review."],
-            }
-        return {
-            "allowed": True,
-            "risk_level": "medium" if has_blocked_signal else "low",
-            "decision": "allow_with_human_review" if has_blocked_signal else "allow",
-            "reasons": ["Fallback safety heuristic found no direct harmful enablement request."],
-            "required_mitigations": ["Maintain human expert oversight for final research decisions."],
-        }
 
 
 class ResearchPlanAgent:
@@ -1960,7 +1886,7 @@ class RankingAgent:
 
 
 class OpenCodeRerankingAgent:
-    """Use OpenCode CLI search/reasoning to rerank the current top-four ideas."""
+    """Use parallel OpenCode CLI reviews to rerank the current top-four ideas."""
 
     def rerank_top_hypotheses(
         self,
@@ -1995,36 +1921,17 @@ class OpenCodeRerankingAgent:
             config.get("codex_rerank_timeout_seconds", 900),
         )
         timeout = int(timeout_value or 900)
-        prompt = self._build_prompt(research_goal, context, candidates)
-        command = ["opencode", "run", "--dangerously-skip-permissions", prompt]
         errors: List[str] = []
-        raw_stdout = ""
-        raw_stderr = ""
-        payload: Dict[str, Any] = {}
+        raw_reviews = run_concurrently(
+            candidates,
+            lambda hypothesis: self._review_one_candidate(research_goal, context, candidates, hypothesis, timeout),
+            max_workers=min(len(candidates), research_goal.max_concurrency),
+        )
+        for review in raw_reviews:
+            errors.extend(review.get("errors", []))
 
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-            raw_stdout = completed.stdout or ""
-            raw_stderr = completed.stderr or ""
-            if completed.returncode != 0:
-                errors.append(f"opencode run exited with {completed.returncode}: {(raw_stderr or raw_stdout)[:1200]}")
-            else:
-                payload = self._parse_json_payload(raw_stdout)
-                if not payload:
-                    errors.append("opencode run returned no parseable JSON payload.")
-        except subprocess.TimeoutExpired as exc:
-            errors.append(f"opencode run timed out after {timeout}s: {exc}")
-        except OSError as exc:
-            errors.append(f"could not run opencode run: {exc}")
-
-        normalized = self._normalize_payload(payload, candidates)
-        if payload and normalized["ranking"]:
+        normalized = self._normalize_parallel_reviews(raw_reviews, candidates)
+        if any(review.get("payload") for review in raw_reviews) and normalized["ranking"]:
             self._apply_ranking(candidates, normalized)
             status = "applied"
         else:
@@ -2036,7 +1943,8 @@ class OpenCodeRerankingAgent:
             "status": status,
             "ranking": normalized["ranking"],
             "evaluations": normalized["evaluations"],
-            "overall_rationale": str(payload.get("overall_rationale") or "").strip() if isinstance(payload, dict) else "",
+            "overall_rationale": self._parallel_overall_rationale(normalized["ranking"], normalized["evaluations"]),
+            "parallel_reviews": raw_reviews,
         }
         context.opencode_rerank_history.append(record)
 
@@ -2048,51 +1956,105 @@ class OpenCodeRerankingAgent:
                 **record,
                 "command": "opencode run --dangerously-skip-permissions",
                 "candidate_ids": [hypothesis.hypothesis_id for hypothesis in candidates],
-                "stdout_tail": raw_stdout[-2000:],
-                "stderr_tail": raw_stderr[-2000:],
+                "parallel_review_count": len(raw_reviews),
             },
             errors=errors,
             duration=time.time() - start_time,
         )
 
-    def _build_prompt(self, research_goal: ResearchGoal, context: ContextMemory, candidates: Sequence[Hypothesis]) -> str:
+    def _review_one_candidate(
+        self,
+        research_goal: ResearchGoal,
+        context: ContextMemory,
+        candidates: Sequence[Hypothesis],
+        candidate: Hypothesis,
+        timeout: int,
+    ) -> Dict[str, Any]:
+        prompt = self._build_candidate_prompt(research_goal, context, candidates, candidate)
+        command = ["opencode", "run", "--dangerously-skip-permissions", prompt]
+        raw_stdout = ""
+        raw_stderr = ""
+        payload: Dict[str, Any] = {}
+        errors: List[str] = []
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            raw_stdout = completed.stdout or ""
+            raw_stderr = completed.stderr or ""
+            if completed.returncode != 0:
+                errors.append(
+                    f"{candidate.hypothesis_id}: opencode run exited with {completed.returncode}: "
+                    f"{(raw_stderr or raw_stdout)[:1200]}"
+                )
+            else:
+                payload = self._parse_json_payload(raw_stdout)
+                if not payload:
+                    errors.append(f"{candidate.hypothesis_id}: opencode run returned no parseable JSON payload.")
+        except subprocess.TimeoutExpired as exc:
+            errors.append(f"{candidate.hypothesis_id}: opencode run timed out after {timeout}s: {exc}")
+        except OSError as exc:
+            errors.append(f"{candidate.hypothesis_id}: could not run opencode run: {exc}")
+
+        return {
+            "id": candidate.hypothesis_id,
+            "payload": payload,
+            "errors": errors,
+            "stdout_tail": raw_stdout[-2000:],
+            "stderr_tail": raw_stderr[-2000:],
+        }
+
+    def _build_candidate_prompt(
+        self,
+        research_goal: ResearchGoal,
+        context: ContextMemory,
+        candidates: Sequence[Hypothesis],
+        candidate: Hypothesis,
+    ) -> str:
         research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
+        competing_candidates = [
+            {
+                "id": hypothesis.hypothesis_id,
+                "title": hypothesis.title,
+                "elo_score": hypothesis.elo_score,
+                "review_summary": hypothesis.review_summary,
+                "scores": hypothesis.scores,
+                "latest_review": hypothesis.review_artifacts[-1] if hypothesis.review_artifacts else {},
+                "latest_opencode_rerank": hypothesis.opencode_rerank_reviews[-1] if hypothesis.opencode_rerank_reviews else {},
+            }
+            for hypothesis in candidates
+            if hypothesis.hypothesis_id != candidate.hypothesis_id
+        ]
         payload = {
-            "task": "Rerank the current top-four research ideas.",
+            "task": "Independently review one candidate from the current top-four research ideas.",
             "instructions": [
-                "Use only the per-idea literature_notes already included in each candidate. Do not run another paper search.",
-                "Compare each idea against the user's goal and the required reference paper.",
-                "For every idea, store detailed critique: novelty risk, feasibility risk, evidence gap, and whether to keep it.",
+                "Use only the included per-idea literature_notes. Do not run another paper search.",
+                "Score this candidate against the user's goal, the research plan, the required reference paper, and the competing candidates.",
+                "Return a calibrated standalone score so local code can merge four parallel reviews into one ranking.",
                 "Prefer ideas that are inspired by the reference paper but do not copy its exact contribution.",
                 "Return strict JSON only, with no markdown or commentary outside JSON.",
             ],
             "research_goal": research_goal.prompt_context(),
             "research_plan": research_plan.to_dict(),
             "reference_paper": context.reference_paper_context or research_goal.reference_paper_context,
-            "candidates": [hypothesis.to_dict() for hypothesis in candidates],
+            "candidate": candidate.to_dict(),
+            "competing_candidates": competing_candidates,
             "required_schema": {
-                "ranking": [
-                    {
-                        "id": "hypothesis id",
-                        "rank": 1,
-                        "overall_score": 0.0,
-                        "keep": True,
-                        "summary": "short judgment",
-                    }
-                ],
-                "evaluations": {
-                    "hypothesis id": {
-                        "summary": "string",
-                        "strengths": ["string"],
-                        "weaknesses": ["string"],
-                        "novelty_risks": ["string"],
-                        "feasibility_risks": ["string"],
-                        "literature_notes": ["string"],
-                        "reference_connection": "string",
-                        "recommended_action": "keep|revise|drop",
-                    }
-                },
-                "overall_rationale": "string",
+                "id": candidate.hypothesis_id,
+                "overall_score": 0.0,
+                "keep": True,
+                "summary": "short judgment",
+                "strengths": ["string"],
+                "weaknesses": ["string"],
+                "novelty_risks": ["string"],
+                "feasibility_risks": ["string"],
+                "literature_notes": ["string"],
+                "reference_connection": "string",
+                "recommended_action": "keep|revise|drop",
             },
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -2124,6 +2086,99 @@ class OpenCodeRerankingAgent:
             except json.JSONDecodeError:
                 return {}
         return {}
+
+    def _normalize_parallel_reviews(
+        self,
+        raw_reviews: Sequence[Dict[str, Any]],
+        candidates: Sequence[Hypothesis],
+    ) -> Dict[str, Any]:
+        by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in candidates}
+        evaluations: Dict[str, Dict[str, Any]] = {}
+        scored: List[Tuple[float, float, str]] = []
+
+        for review in raw_reviews:
+            hypothesis_id = str(review.get("id") or "").strip()
+            if hypothesis_id not in by_id:
+                continue
+            payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+            evaluation = self._normalize_candidate_evaluation(payload, hypothesis_id)
+            evaluations[hypothesis_id] = evaluation
+            scored.append(
+                (
+                    evaluation["overall_score"],
+                    by_id[hypothesis_id].elo_score,
+                    hypothesis_id,
+                )
+            )
+
+        for hypothesis in candidates:
+            if hypothesis.hypothesis_id not in evaluations:
+                evaluations[hypothesis.hypothesis_id] = self._fallback_candidate_evaluation(hypothesis)
+                scored.append((0.0, hypothesis.elo_score, hypothesis.hypothesis_id))
+
+        ranking = []
+        for rank, (_score, _elo, hypothesis_id) in enumerate(sorted(scored, reverse=True), start=1):
+            evaluation = evaluations[hypothesis_id]
+            ranking.append(
+                {
+                    "id": hypothesis_id,
+                    "rank": rank,
+                    "overall_score": evaluation["overall_score"],
+                    "keep": evaluation["keep"],
+                    "summary": evaluation["summary"],
+                }
+            )
+        return {"ranking": ranking, "evaluations": evaluations}
+
+    def _normalize_candidate_evaluation(self, payload: Dict[str, Any], expected_id: str) -> Dict[str, Any]:
+        hypothesis_id = str(payload.get("id") or payload.get("hypothesis_id") or expected_id).strip()
+        if hypothesis_id != expected_id:
+            hypothesis_id = expected_id
+        recommended_action = str(payload.get("recommended_action") or "revise").strip().lower()
+        keep = payload.get("keep")
+        if keep is None:
+            keep = recommended_action != "drop"
+        return {
+            "id": hypothesis_id,
+            "summary": str(payload.get("summary") or "").strip(),
+            "strengths": coerce_string_list(payload.get("strengths", [])),
+            "weaknesses": coerce_string_list(payload.get("weaknesses", [])),
+            "novelty_risks": coerce_string_list(payload.get("novelty_risks", [])),
+            "feasibility_risks": coerce_string_list(payload.get("feasibility_risks", [])),
+            "literature_notes": coerce_string_list(payload.get("literature_notes", [])),
+            "reference_connection": str(payload.get("reference_connection") or "").strip(),
+            "recommended_action": recommended_action,
+            "overall_score": self._coerce_float(payload.get("overall_score")),
+            "keep": bool(keep),
+        }
+
+    def _fallback_candidate_evaluation(self, hypothesis: Hypothesis) -> Dict[str, Any]:
+        return {
+            "id": hypothesis.hypothesis_id,
+            "summary": "",
+            "strengths": [],
+            "weaknesses": [],
+            "novelty_risks": [],
+            "feasibility_risks": [],
+            "literature_notes": [],
+            "reference_connection": "",
+            "recommended_action": "revise",
+            "overall_score": 0.0,
+            "keep": True,
+        }
+
+    def _parallel_overall_rationale(
+        self,
+        ranking: Sequence[Dict[str, Any]],
+        evaluations: Dict[str, Dict[str, Any]],
+    ) -> str:
+        if not ranking:
+            return ""
+        top_id = str(ranking[0].get("id") or "")
+        summary = str(evaluations.get(top_id, {}).get("summary") or "").strip()
+        if summary:
+            return f"{top_id} ranked first by parallel OpenCode review: {summary}"
+        return f"{top_id} ranked first by parallel OpenCode review."
 
     def _normalize_payload(self, payload: Dict[str, Any], candidates: Sequence[Hypothesis]) -> Dict[str, Any]:
         candidate_ids = [hypothesis.hypothesis_id for hypothesis in candidates]
@@ -2520,27 +2575,22 @@ class MetaReviewAgent:
         )[: research_goal.max_literature_results]
         literature_notes = list(seeded_notes)
         errors: List[str] = []
+        opencode_audit: Dict[str, Any] = {}
 
         try:
-            payload = _coerce_mapping(call_json(
-                build_meta_review_messages(
-                    research_goal=research_goal.prompt_context(),
-                    research_plan=research_plan.to_dict(),
-                    ranked_hypotheses=[hypothesis.compact_summary() for hypothesis in ranked],
-                    recent_reviews=recent_reviews,
-                    tournament_history=context.tournament_results + context.opencode_rerank_history,
-                    proximity_summary={
-                        "clusters": proximity_data.get("clusters", []),
-                        "duplicate_candidates": proximity_data.get("duplicate_candidates", []),
-                    },
-                    trajectory_state=trajectory_state,
-                    literature_notes=literature_notes,
-                ),
-                model=research_goal.critic_llm_model,
-                temperature=max(0.1, research_goal.reflection_temperature - 0.1),
-                profile="critic",
-            ), self._fallback_meta_review(context))
-        except LLMCallError as exc:
+            payload, opencode_audit = self._fetch_opencode_meta_review(
+                research_goal=research_goal,
+                research_plan=research_plan,
+                context=context,
+                ranked=ranked,
+                recent_reviews=recent_reviews,
+                proximity_data=proximity_data,
+                trajectory_state=trajectory_state,
+                literature_notes=literature_notes,
+            )
+            payload = _coerce_mapping(payload, self._fallback_meta_review(context))
+            errors.extend(coerce_string_list(opencode_audit.get("errors", [])))
+        except Exception as exc:  # noqa: BLE001
             payload = self._fallback_meta_review(context)
             errors.append(str(exc))
 
@@ -2581,10 +2631,134 @@ class MetaReviewAgent:
         return StepResult(
             name="meta_review",
             hypotheses=ranked[:3],
-            data={**context.latest_meta_review(), "literature_reuse_count": len(seeded_notes)},
+            data={
+                **context.latest_meta_review(),
+                "literature_reuse_count": len(seeded_notes),
+                "meta_review_mode": "opencode",
+                "opencode_audit": opencode_audit,
+            },
             errors=errors,
             duration=time.time() - start_time,
         )
+
+    def _fetch_opencode_meta_review(
+        self,
+        research_goal: ResearchGoal,
+        research_plan: ResearchPlan,
+        context: ContextMemory,
+        ranked: Sequence[Hypothesis],
+        recent_reviews: List[Dict[str, Any]],
+        proximity_data: Dict[str, Any],
+        trajectory_state: Dict[str, Any],
+        literature_notes: List[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        timeout_value = config.get(
+            "opencode_meta_review_timeout_seconds",
+            config.get("opencode_rerank_timeout_seconds", 900),
+        )
+        try:
+            timeout = max(1, int(timeout_value or 900))
+        except (TypeError, ValueError):
+            timeout = 900
+        prompt = self._build_opencode_meta_review_prompt(
+            research_goal=research_goal,
+            research_plan=research_plan,
+            context=context,
+            ranked=ranked,
+            recent_reviews=recent_reviews,
+            proximity_data=proximity_data,
+            trajectory_state=trajectory_state,
+            literature_notes=literature_notes,
+        )
+        command = ["opencode", "run", "--dangerously-skip-permissions", prompt]
+        raw_stdout = ""
+        raw_stderr = ""
+        errors: List[str] = []
+        payload: Dict[str, Any] = {}
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            raw_stdout = completed.stdout or ""
+            raw_stderr = completed.stderr or ""
+            if completed.returncode != 0:
+                errors.append(f"opencode meta-review exited with {completed.returncode}: {(raw_stderr or raw_stdout)[:1200]}")
+            else:
+                payload = _parse_json_object_from_text(raw_stdout)
+                if not payload:
+                    errors.append("opencode meta-review returned no parseable JSON payload.")
+        except subprocess.TimeoutExpired as exc:
+            errors.append(f"opencode meta-review timed out after {timeout}s: {exc}")
+        except OSError as exc:
+            errors.append(f"could not run opencode meta-review: {exc}")
+        return payload, {
+            "command": "opencode run --dangerously-skip-permissions",
+            "timeout_seconds": timeout,
+            "errors": errors,
+            "stdout_tail": raw_stdout[-2000:],
+            "stderr_tail": raw_stderr[-2000:],
+        }
+
+    def _build_opencode_meta_review_prompt(
+        self,
+        research_goal: ResearchGoal,
+        research_plan: ResearchPlan,
+        context: ContextMemory,
+        ranked: Sequence[Hypothesis],
+        recent_reviews: List[Dict[str, Any]],
+        proximity_data: Dict[str, Any],
+        trajectory_state: Dict[str, Any],
+        literature_notes: List[Dict[str, Any]],
+    ) -> str:
+        payload = {
+            "task": "Perform a meta-review over the current research state.",
+            "instructions": [
+                "Use the included hypotheses, review artifacts, tournament history, OpenCode rerank history, proximity diagnostics, and literature notes.",
+                "Do not run another paper search; this is a synthesis and guidance pass.",
+                "Identify recurring critique, blind spots, frontier story quality, method-stacking risk, and next-iteration guidance.",
+                "Return strict JSON only, with no markdown or commentary outside JSON.",
+            ],
+            "research_goal": research_goal.prompt_context(),
+            "research_plan": research_plan.to_dict(),
+            "ranked_hypotheses": [hypothesis.compact_summary() for hypothesis in ranked],
+            "recent_reviews": recent_reviews[-10:],
+            "tournament_history": (context.tournament_results + context.opencode_rerank_history)[-12:],
+            "proximity_summary": {
+                "clusters": proximity_data.get("clusters", []),
+                "duplicate_candidates": proximity_data.get("duplicate_candidates", []),
+            },
+            "trajectory_state": trajectory_state,
+            "literature_notes": literature_notes,
+            "required_schema": {
+                "meta_review_critique": ["string"],
+                "story_guidance": {
+                    "frontier_story": "string",
+                    "method_stacking_patterns": ["string"],
+                    "theory_gaps": ["string"],
+                    "next_generation_story_targets": ["string"],
+                    "combination_policy": "string",
+                },
+                "generation_guidance": ["string"],
+                "reflection_guidance": ["string"],
+                "ranking_guidance": ["string"],
+                "research_overview": {
+                    "summary": "string",
+                    "frontier_storyline": "string",
+                    "anti_combination_guidance": ["string"],
+                    "theory_gaps": ["string"],
+                    "priority_areas": ["string"],
+                    "top_ranked_hypotheses": ["string"],
+                    "suggested_next_steps": ["string"],
+                    "suggested_experiments": ["string"],
+                },
+                "expert_profiles": ["string"],
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _fallback_meta_review(self, context: ContextMemory) -> Dict[str, Any]:
         ranked = context.get_ranked_hypotheses()

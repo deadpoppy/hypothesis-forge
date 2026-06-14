@@ -14,7 +14,6 @@ from .agents import (
     RankingAgent,
     ReflectionAgent,
     ResearchPlanAgent,
-    SafetyReviewAgent,
 )
 from .models import ContextMemory, ResearchGoal, StepResult
 from .utils import logger
@@ -25,7 +24,6 @@ class SupervisorAgent:
 
     def __init__(self) -> None:
         self.research_plan_agent = ResearchPlanAgent()
-        self.safety_review_agent = SafetyReviewAgent()
         self.generation_agent = GenerationAgent()
         self.idea_literature_agent = IdeaLiteratureAgent()
         self.reflection_agent = ReflectionAgent()
@@ -62,17 +60,6 @@ class SupervisorAgent:
         def emit_progress(step_name: str) -> None:
             if progress_callback is not None:
                 progress_callback(step_name, cycle_details, context)
-
-        if research_goal.enable_safety_review:
-            safety_result = self.safety_review_agent.review_goal(research_goal)
-            self._add_step(cycle_details, safety_result)
-            emit_progress("goal_safety_review")
-            if not safety_result.data.get("allowed", False):
-                cycle_details["errors"].append("Research goal blocked by safety review.")
-                cycle_details["statistics_after"] = context.compute_statistics()
-                cycle_details["cycle_duration"] = time.time() - cycle_start
-                emit_progress("blocked")
-                return cycle_details
 
         if context.research_plan is None:
             context.research_plan = self.research_plan_agent.create_plan(research_goal)
