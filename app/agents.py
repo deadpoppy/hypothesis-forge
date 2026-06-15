@@ -973,20 +973,35 @@ class IdeaLiteratureAgent:
         hypothesis.literature_fetch_signature = current_signature
         hypothesis.literature_notes = notes
         search_summary = str(payload.get("search_summary") or payload.get("summary") or "").strip() if payload else ""
+        story_issue = str(payload.get("story_issue") or "").strip() if payload else ""
+        story_issue_category = (
+            str(payload.get("story_issue_category") or "").strip().lower() if payload else ""
+        )
+        hypothesis.literature_story_issue = story_issue or None
         audit_payload = {
             "status": status,
             "method": "opencode_per_idea_literature",
             "paper_count": len(notes),
             "short_summary": search_summary or f"OpenCode returned {len(notes)} related papers for this idea.",
             "search_terms": coerce_string_list(payload.get("search_terms", [])) if payload else [],
+            "story_issue": story_issue,
+            "story_issue_category": story_issue_category,
             "errors": errors,
             "stdout_tail": raw_stdout[-2000:],
             "stderr_tail": raw_stderr[-2000:],
         }
         hypothesis.literature_fetch_audit = audit_payload
+        extra_comments: List[str] = []
         if search_summary:
+            extra_comments.append(f"{step_name}: {search_summary}")
+        if story_issue:
+            prefix = f"{step_name} story_issue"
+            if story_issue_category:
+                prefix = f"{prefix} ({story_issue_category})"
+            extra_comments.append(f"{prefix}: {story_issue}")
+        if extra_comments:
             hypothesis.review_comments = dedupe_preserve_order(
-                hypothesis.review_comments + [f"{step_name}: {search_summary}"]
+                hypothesis.review_comments + extra_comments
             )
         return audit_payload
 
@@ -999,12 +1014,14 @@ class IdeaLiteratureAgent:
     ) -> str:
         research_plan = context.research_plan or ResearchPlan.from_goal(research_goal)
         payload = {
-            "task": "Find related academic papers for one research idea.",
+            "task": "Find related academic papers for one research idea, and identify the single biggest reason this idea is NOT yet a top-tier-conference story.",
             "instructions": [
                 "Use your paper/web search ability once for this idea.",
                 "Return papers useful for novelty checking, evaluation, and future evolution of this exact idea.",
                 "Prefer real, citable papers. Include close prior art, relevant benchmarks, and adjacent methods.",
                 "Do not rank or reject the idea. Only provide concise paper metadata and why each paper matters.",
+                "Then, as a senior reviewer for a top-tier venue (NeurIPS/ICML/ICLR/CVPR/etc.), name the ONE biggest issue that currently prevents this idea from being a strong top-conference paper story. Be concrete and specific (e.g. 'novelty is incremental over X', 'no defensible mechanistic claim', 'evaluation is a toy benchmark with no baselines', 'the story is method-stacking without a unifying insight', 'the claim is not falsifiable').",
+                "Field story_issue must be that single sharpest blocker in 1-2 sentences. Field story_issue_category must be one of: novelty, story_coherence, theoretical_depth, evaluation, feasibility, motivation, positioning, other.",
                 "Return strict JSON only, with no markdown or commentary outside JSON.",
             ],
             "research_goal": research_goal.prompt_context(),
@@ -1029,6 +1046,8 @@ class IdeaLiteratureAgent:
                 ],
                 "search_terms": ["string"],
                 "search_summary": "string",
+                "story_issue": "the single biggest reason this idea is NOT a top-tier-conference story, 1-2 sentences, written from a senior reviewer's perspective",
+                "story_issue_category": "novelty|story_coherence|theoretical_depth|evaluation|feasibility|motivation|positioning|other",
             },
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)

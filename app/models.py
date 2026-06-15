@@ -477,6 +477,7 @@ class Hypothesis:
     literature_notes: List[Dict[str, Any]] = field(default_factory=list)
     literature_fetch_signature: Optional[str] = None
     literature_fetch_audit: Dict[str, Any] = field(default_factory=dict)
+    literature_story_issue: Optional[str] = None
     debate_history: List[Dict[str, Any]] = field(default_factory=list)
     debate_digest: Optional[str] = None
     review_artifacts: List[Dict[str, Any]] = field(default_factory=list)
@@ -545,6 +546,9 @@ class Hypothesis:
             literature_notes=_dict_list(data.get("literature_notes")),
             literature_fetch_signature=data.get("literature_fetch_signature"),
             literature_fetch_audit=_mapping(data.get("literature_fetch_audit")),
+            literature_story_issue=(
+                str(data.get("literature_story_issue") or "").strip() or None
+            ),
             debate_history=_dict_list(data.get("debate_history")),
             debate_digest=data.get("debate_digest"),
             review_artifacts=_dict_list(data.get("review_artifacts")),
@@ -652,6 +656,7 @@ class Hypothesis:
             "verdict": self.review_verdict,
             "latest_review": self.review_artifacts[-1] if self.review_artifacts else {},
             "latest_opencode_rerank": self.opencode_rerank_reviews[-1] if self.opencode_rerank_reviews else {},
+            "literature_story_issue": self.literature_story_issue,
         }
 
     def comparison_signature(self) -> str:
@@ -786,6 +791,7 @@ class Hypothesis:
             "debate_digest": self.debate_digest,
             "latest_review": self.review_artifacts[-1] if self.review_artifacts else {},
             "latest_opencode_rerank": self.opencode_rerank_reviews[-1] if self.opencode_rerank_reviews else {},
+            "literature_story_issue": self.literature_story_issue,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -826,6 +832,7 @@ class Hypothesis:
             "literature_notes": self.literature_notes,
             "literature_fetch_signature": self.literature_fetch_signature,
             "literature_fetch_audit": self.literature_fetch_audit,
+            "literature_story_issue": self.literature_story_issue,
             "debate_history": self.debate_history[-20:],
             "debate_digest": self.debate_digest,
             "review_artifacts": self.review_artifacts[-3:],
