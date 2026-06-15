@@ -15,7 +15,7 @@ from .agents import (
     ReflectionAgent,
     ResearchPlanAgent,
 )
-from .models import ContextMemory, ResearchGoal, StepResult
+from .models import ContextMemory, Hypothesis, ResearchGoal, StepResult
 from .utils import logger
 
 
@@ -54,7 +54,7 @@ class SupervisorAgent:
             "research_plan": context.research_plan.to_dict() if context.research_plan else {},
             "steps": {},
             "errors": [],
-            "statistics_before": context.compute_statistics(),
+            "statistics_before": context.compute_statistics(top_k=research_goal.top_k_hypotheses),
         }
 
         def emit_progress(step_name: str) -> None:
@@ -190,7 +190,7 @@ class SupervisorAgent:
         emit_progress("frontier_decay")
 
         context.iteration_number += 1
-        context.last_cycle_statistics = context.compute_statistics()
+        context.last_cycle_statistics = context.compute_statistics(top_k=research_goal.top_k_hypotheses)
         cycle_details["statistics_after"] = context.last_cycle_statistics
         cycle_details["cycle_duration"] = time.time() - cycle_start
         context.cycle_history.append(
@@ -284,16 +284,50 @@ class SupervisorAgent:
                 )
             )
 
+        # Hard cap on the active pool. After fractional decay, deactivate the
+        # lowest-Elo survivors until the pool fits under max_active_hypotheses.
+        # minimum_survivors always protects a floor so the frontier cannot
+        # collapse below top_k.
+        hard_cap = max(minimum_survivors, int(research_goal.max_active_hypotheses))
+        cap_pruned: List[Hypothesis] = []
+        survivors_after_decay = [hypothesis for hypothesis in active_hypotheses if hypothesis.is_active]
+        if len(survivors_after_decay) > hard_cap:
+            survivors_sorted = sorted(
+                survivors_after_decay,
+                key=lambda hypothesis: (hypothesis.elo_score, hypothesis.created_in_iteration, hypothesis.hypothesis_id),
+            )
+            cap_pruned = survivors_sorted[: len(survivors_after_decay) - hard_cap]
+            for hypothesis in cap_pruned:
+                hypothesis.is_active = False
+                hypothesis.review_verdict = "frontier_cap_exceeded"
+                hypothesis.review_comments = list(
+                    dict.fromkeys(
+                        hypothesis.review_comments
+                        + [
+                            (
+                                f"frontier_cap: deactivated at cycle end because the active pool "
+                                f"({len(survivors_after_decay)}) exceeded the hard cap "
+                                f"({hard_cap})."
+                            )
+                        ]
+                    )
+                )
+
+        all_pruned = pruned_hypotheses + cap_pruned
+        active_after = len(active_hypotheses) - len(all_pruned)
         return StepResult(
             name="frontier_decay",
-            hypotheses=pruned_hypotheses,
+            hypotheses=all_pruned,
             data={
                 "decay_fraction": fraction,
                 "minimum_survivors": minimum_survivors,
+                "max_active_hypotheses": hard_cap,
                 "active_before": len(active_hypotheses),
-                "active_after": len(active_hypotheses) - len(pruned_hypotheses),
-                "pruned_count": len(pruned_hypotheses),
-                "pruned_hypotheses": [hypothesis.compact_summary() for hypothesis in pruned_hypotheses],
+                "active_after": active_after,
+                "pruned_count": len(all_pruned),
+                "decay_pruned_count": len(pruned_hypotheses),
+                "cap_pruned_count": len(cap_pruned),
+                "pruned_hypotheses": [hypothesis.compact_summary() for hypothesis in all_pruned],
             },
         )
 

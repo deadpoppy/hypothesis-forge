@@ -34,6 +34,24 @@ from .utils import (
 )
 
 
+def _run_opencode(prompt: str, timeout: int) -> subprocess.CompletedProcess:
+    """Invoke `opencode run` feeding the prompt via stdin.
+
+    Prompts can exceed MAX_ARG_STRLEN (128KB) when they carry full hypothesis
+    context, which makes argv-based invocation fail with E2BIG. Passing the
+    prompt through stdin avoids the per-argument hard limit entirely.
+    """
+    command = ["opencode", "run", "--dangerously-skip-permissions"]
+    return subprocess.run(
+        command,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
 def _compose_hypothesis_text(payload: Dict[str, Any]) -> str:
     core_text = (
         payload.get("core_hypothesis")
@@ -929,19 +947,12 @@ class IdeaLiteratureAgent:
 
         timeout = _opencode_literature_timeout()
         prompt = self._build_opencode_literature_prompt(research_goal, context, hypothesis, max_papers)
-        command = ["opencode", "run", "--dangerously-skip-permissions", prompt]
         raw_stdout = ""
         raw_stderr = ""
         errors: List[str] = []
         payload: Dict[str, Any] = {}
         try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
+            completed = _run_opencode(prompt, timeout)
             raw_stdout = completed.stdout or ""
             raw_stderr = completed.stderr or ""
             if completed.returncode != 0:
@@ -999,7 +1010,7 @@ class IdeaLiteratureAgent:
             "research_goal": research_goal.prompt_context(),
             "research_plan": research_plan.to_dict(),
             "reference_paper": context.reference_paper_context or research_goal.reference_paper_context,
-            "idea": hypothesis.to_dict(),
+            "idea": hypothesis.to_prompt_dict(),
             "max_papers": max_papers,
             "required_schema": {
                 "papers": [
@@ -1436,8 +1447,8 @@ class RankingAgent:
                 "loser_score_after": round(loser.elo_score, 2),
             }
             if counted_for_elo:
-                winner.debate_history.append(match_record)
-                loser.debate_history.append(match_record)
+                winner.record_debate_outcome(match_record)
+                loser.record_debate_outcome(match_record)
                 context.tournament_results.append(match_record)
                 self._store_pairwise_decision(context, hypothesis_a, hypothesis_b, payload, match_record)
             matches.append(match_record)
@@ -1971,19 +1982,12 @@ class OpenCodeRerankingAgent:
         timeout: int,
     ) -> Dict[str, Any]:
         prompt = self._build_candidate_prompt(research_goal, context, candidates, candidate)
-        command = ["opencode", "run", "--dangerously-skip-permissions", prompt]
         raw_stdout = ""
         raw_stderr = ""
         payload: Dict[str, Any] = {}
         errors: List[str] = []
         try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
+            completed = _run_opencode(prompt, timeout)
             raw_stdout = completed.stdout or ""
             raw_stderr = completed.stderr or ""
             if completed.returncode != 0:
@@ -2041,7 +2045,7 @@ class OpenCodeRerankingAgent:
             "research_goal": research_goal.prompt_context(),
             "research_plan": research_plan.to_dict(),
             "reference_paper": context.reference_paper_context or research_goal.reference_paper_context,
-            "candidate": candidate.to_dict(),
+            "candidate": candidate.to_prompt_dict(),
             "competing_candidates": competing_candidates,
             "required_schema": {
                 "id": candidate.hypothesis_id,
@@ -2670,19 +2674,13 @@ class MetaReviewAgent:
             trajectory_state=trajectory_state,
             literature_notes=literature_notes,
         )
-        command = ["opencode", "run", "--dangerously-skip-permissions", prompt]
+        command = ["opencode", "run", "--dangerously-skip-permissions"]
         raw_stdout = ""
         raw_stderr = ""
         errors: List[str] = []
         payload: Dict[str, Any] = {}
         try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
+            completed = _run_opencode(prompt, timeout)
             raw_stdout = completed.stdout or ""
             raw_stderr = completed.stderr or ""
             if completed.returncode != 0:

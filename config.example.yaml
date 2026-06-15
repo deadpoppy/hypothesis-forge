@@ -45,6 +45,7 @@ embedding_concurrency: 1
 elo_k_factor: 32
 proximity_similarity_threshold: 0.55
 hypothesis_decay_fraction: 0.0
+max_active_hypotheses: 12
 enable_opencode_reranking: true
 opencode_rerank_timeout_seconds: 900
 opencode_meta_review_timeout_seconds: 900

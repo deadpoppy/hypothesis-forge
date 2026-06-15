@@ -1317,7 +1317,9 @@ critic_llm:
 
         def fake_run(command, **kwargs):
             self.assertEqual(command[:3], ["opencode", "run", "--dangerously-skip-permissions"])
-            prompt = json.loads(command[3])
+            prompt_text = kwargs.get("input") or ""
+            self.assertTrue(prompt_text, "prompt must be fed via stdin input")
+            prompt = json.loads(prompt_text)
             idea_id = prompt["idea"]["id"]
             payload = {
                 "papers": [
@@ -1820,8 +1822,10 @@ critic_llm:
             "H4": 3.0,
         }
 
-        def fake_run(command, **_kwargs):
-            prompt_payload = json.loads(command[-1])
+        def fake_run(command, **kwargs):
+            prompt_text = kwargs.get("input") or ""
+            self.assertTrue(prompt_text, "prompt must be fed via stdin input")
+            prompt_payload = json.loads(prompt_text)
             hypothesis_id = prompt_payload["candidate"]["id"]
             payload = {
                 "id": hypothesis_id,
@@ -1841,10 +1845,11 @@ critic_llm:
             result = OpenCodeRerankingAgent().rerank_top_hypotheses(goal, context)
 
         command = mocked_run.call_args.args[0]
+        prompt_input = mocked_run.call_args.kwargs.get("input", "")
         self.assertEqual(mocked_run.call_count, 4)
         self.assertEqual(command[:3], ["opencode", "run", "--dangerously-skip-permissions"])
-        self.assertEqual(len(command), 4)
-        self.assertIn("Independently review one candidate", command[-1])
+        self.assertEqual(len(command), 3)
+        self.assertIn("Independently review one candidate", prompt_input)
         self.assertEqual(result.data["status"], "applied")
         self.assertEqual(result.data["command"], "opencode run --dangerously-skip-permissions")
         self.assertEqual(result.data["parallel_review_count"], 4)

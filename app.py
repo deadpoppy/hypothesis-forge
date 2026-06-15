@@ -93,6 +93,7 @@ def _build_research_goal(args: argparse.Namespace, constraints: Dict[str, Any]) 
         ranking_matches_per_cycle=args.ranking_matches_per_cycle,
         proximity_similarity_threshold=args.proximity_similarity_threshold,
         hypothesis_decay_fraction=args.hypothesis_decay_fraction,
+        max_active_hypotheses=args.max_active_hypotheses,
         max_concurrency=args.max_concurrency,
     )
 
@@ -353,6 +354,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Fraction of the lowest-Elo active hypotheses to deactivate at the end of each cycle.",
+    )
+    parser.add_argument(
+        "--max-active-hypotheses",
+        type=int,
+        default=None,
+        help="Hard cap on the number of active hypotheses. Excess lowest-Elo hypotheses are deactivated at the end of each cycle.",
     )
     parser.add_argument("--max-concurrency", type=int, default=None, help="Maximum concurrent LLM/tool calls for parallel-safe stages.")
     parser.add_argument(

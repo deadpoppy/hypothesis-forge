@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import statistics
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -30,12 +31,15 @@ def _stringify_constraint_values(prefix: str, items: Any) -> List[str]:
     return [f"{prefix}: {value}" for value in values]
 
 
-def _bounded_int(value: Any, default: int, minimum: int = 1) -> int:
+def _bounded_int(value: Any, default: int, minimum: int = 1, maximum: Optional[int] = None) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return default
-    return max(minimum, parsed)
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
 
 
 def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -> float:
@@ -156,6 +160,7 @@ class ResearchGoal:
     ranking_matches_per_cycle: Optional[int] = None
     proximity_similarity_threshold: Optional[float] = None
     hypothesis_decay_fraction: Optional[float] = None
+    max_active_hypotheses: Optional[int] = None
     max_concurrency: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -234,6 +239,14 @@ class ResearchGoal:
             minimum=0.0,
             maximum=1.0,
         )
+        self.max_active_hypotheses = _bounded_int(
+            self.max_active_hypotheses
+            if self.max_active_hypotheses is not None
+            else config.get("max_active_hypotheses", 12),
+            default=12,
+            minimum=2,
+            maximum=200,
+        )
         self.max_concurrency = _bounded_int(
             self.max_concurrency if self.max_concurrency is not None else config.get("max_concurrency", 8),
             default=8,
@@ -258,6 +271,7 @@ class ResearchGoal:
                 str(self.ranking_matches_per_cycle),
                 str(self.proximity_similarity_threshold),
                 str(self.hypothesis_decay_fraction),
+                str(self.max_active_hypotheses),
                 str(self.max_concurrency),
             ]
         )
@@ -464,6 +478,7 @@ class Hypothesis:
     literature_fetch_signature: Optional[str] = None
     literature_fetch_audit: Dict[str, Any] = field(default_factory=dict)
     debate_history: List[Dict[str, Any]] = field(default_factory=list)
+    debate_digest: Optional[str] = None
     review_artifacts: List[Dict[str, Any]] = field(default_factory=list)
     opencode_rerank_reviews: List[Dict[str, Any]] = field(default_factory=list)
     is_active: bool = True
@@ -531,6 +546,7 @@ class Hypothesis:
             literature_fetch_signature=data.get("literature_fetch_signature"),
             literature_fetch_audit=_mapping(data.get("literature_fetch_audit")),
             debate_history=_dict_list(data.get("debate_history")),
+            debate_digest=data.get("debate_digest"),
             review_artifacts=_dict_list(data.get("review_artifacts")),
             opencode_rerank_reviews=_dict_list(
                 data.get("opencode_rerank_reviews")
@@ -697,6 +713,81 @@ class Hypothesis:
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
+    def record_debate_outcome(self, match_record: Dict[str, Any], window: int = 8) -> None:
+        """Fold a tournament match into this hypothesis's recurrent debate state.
+
+        debate_history is bounded to a rolling window of recent matches, and
+        debate_digest is overwritten with a compact synthesis of the latest
+        outcomes. This forms the self-loop the user described: the prior
+        evaluation (digest) flows into the next debate, the debate produces a
+        fresh outcome, and the digest is updated in place instead of growing.
+        """
+        self.debate_history.append(match_record)
+        if len(self.debate_history) > window:
+            self.debate_history = self.debate_history[-window:]
+
+        recent = self.debate_history[-window:]
+        won = sum(
+            1
+            for record in recent
+            if record.get("winner") == self.hypothesis_id and record.get("counted_for_elo")
+        )
+        lost = sum(
+            1
+            for record in recent
+            if record.get("loser") == self.hypothesis_id and record.get("counted_for_elo")
+        )
+        digest_lines = [f"elo={round(self.elo_score, 1)} recent_wins={won} recent_losses={lost}"]
+        for record in recent[-4:]:
+            role = "won" if record.get("winner") == self.hypothesis_id else "lost"
+            reason = str(record.get("winner_reason") or record.get("comparison_summary") or "").strip()
+            if reason:
+                digest_lines.append(f"[{role}] {reason[:280]}")
+        self.debate_digest = "\n".join(digest_lines)[:1500]
+
+    def to_prompt_dict(self) -> Dict[str, Any]:
+        """Compact projection for LLM/OpenCode prompts.
+
+        Excludes the unbounded debate_history/review_artifacts/literature blobs
+        that previously inflated prompts past the 128KB argv limit. The
+        recurrent debate_digest carries the evaluation self-loop instead.
+        """
+        return {
+            "id": self.hypothesis_id,
+            "title": self.title,
+            "text": self.text,
+            "focus_area": self.focus_area,
+            "primary_bottleneck": self.primary_bottleneck,
+            "rationale": self.rationale,
+            "mechanism": self.mechanism,
+            "problem_framing": self.problem_framing,
+            "central_insight": self.central_insight,
+            "theoretical_story": self.theoretical_story,
+            "why_not_simple_combination": self.why_not_simple_combination,
+            "generation_strategy": self.generation_strategy,
+            "mutation_operator": self.mutation_operator,
+            "evolution_delta": self.evolution_delta,
+            "origin": self.origin,
+            "parent_ids": self.parent_ids,
+            "predictions": self.predictions,
+            "key_assumptions": self.key_assumptions,
+            "validation_experiments": self.validation_experiments,
+            "failure_modes": self.failure_modes,
+            "improvement_actions": self.improvement_actions,
+            "novelty_review": self.novelty_review,
+            "feasibility_review": self.feasibility_review,
+            "correctness_review": self.correctness_review,
+            "testability_review": self.testability_review,
+            "review_verdict": self.review_verdict,
+            "review_summary": self.review_summary,
+            "scores": self.scores,
+            "elo_score": self.elo_score,
+            "references": self.references,
+            "debate_digest": self.debate_digest,
+            "latest_review": self.review_artifacts[-1] if self.review_artifacts else {},
+            "latest_opencode_rerank": self.opencode_rerank_reviews[-1] if self.opencode_rerank_reviews else {},
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.hypothesis_id,
@@ -735,12 +826,43 @@ class Hypothesis:
             "literature_notes": self.literature_notes,
             "literature_fetch_signature": self.literature_fetch_signature,
             "literature_fetch_audit": self.literature_fetch_audit,
-            "debate_history": self.debate_history,
-            "review_artifacts": self.review_artifacts,
-            "opencode_rerank_reviews": self.opencode_rerank_reviews,
+            "debate_history": self.debate_history[-20:],
+            "debate_digest": self.debate_digest,
+            "review_artifacts": self.review_artifacts[-3:],
+            "opencode_rerank_reviews": self.opencode_rerank_reviews[-3:],
             "is_active": self.is_active,
             "created_in_iteration": self.created_in_iteration,
         }
+
+
+def _compact_hypothesis_dict(hypothesis: Hypothesis) -> Dict[str, Any]:
+    """Aggressively slimmed projection for per-step checkpoint records.
+
+    Step hypotheses are only used for reporting/audit; the live runtime always
+    reads from context.hypotheses (full objects), so we can drop the heavy
+    debate_history/literature/review blobs entirely here.
+    """
+    return {
+        "id": hypothesis.hypothesis_id,
+        "title": hypothesis.title,
+        "text": hypothesis.text,
+        "focus_area": hypothesis.focus_area,
+        "primary_bottleneck": hypothesis.primary_bottleneck,
+        "central_insight": hypothesis.central_insight,
+        "theoretical_story": hypothesis.theoretical_story,
+        "generation_strategy": hypothesis.generation_strategy,
+        "mutation_operator": hypothesis.mutation_operator,
+        "evolution_delta": hypothesis.evolution_delta,
+        "origin": hypothesis.origin,
+        "parent_ids": hypothesis.parent_ids,
+        "review_verdict": hypothesis.review_verdict,
+        "review_summary": hypothesis.review_summary,
+        "scores": hypothesis.scores,
+        "elo_score": hypothesis.elo_score,
+        "is_active": hypothesis.is_active,
+        "created_in_iteration": hypothesis.created_in_iteration,
+        "debate_digest": hypothesis.debate_digest,
+    }
 
 
 @dataclass
@@ -753,7 +875,7 @@ class StepResult:
 
     def to_dict(self) -> Dict[str, Any]:
         payload = dict(self.data)
-        payload["hypotheses"] = [hypothesis.to_dict() for hypothesis in self.hypotheses]
+        payload["hypotheses"] = [_compact_hypothesis_dict(hypothesis) for hypothesis in self.hypotheses]
         if self.errors:
             payload["errors"] = self.errors
         if self.duration:
@@ -862,7 +984,7 @@ class ContextMemory:
         ranked = self.get_ranked_hypotheses()[:limit]
         return [hypothesis.compact_summary() for hypothesis in ranked]
 
-    def compute_statistics(self) -> Dict[str, Any]:
+    def compute_statistics(self, top_k: Optional[int] = None) -> Dict[str, Any]:
         all_hypotheses = list(self.hypotheses.values())
         active_hypotheses = self.get_active_hypotheses()
         scores = [hypothesis.overall_score() for hypothesis in all_hypotheses if hypothesis.overall_score() > 0]
@@ -884,6 +1006,16 @@ class ContextMemory:
             dominant_focus_area, dominant_count = max(focus_counts.items(), key=lambda item: item[1])
             dominant_focus_area_share = round(dominant_count / len(all_hypotheses), 3)
 
+        active_elo_values = sorted(hypothesis.elo_score for hypothesis in active_hypotheses)
+        active_median_elo = round(statistics.median(active_elo_values), 2) if active_elo_values else 0.0
+        ranked_elo = sorted(active_elo_values, reverse=True)
+        k_value = max(1, int(top_k) if top_k and top_k > 0 else min(3, len(ranked_elo)) if ranked_elo else 1)
+        top_k_elo = round(sum(ranked_elo[:k_value]) / min(k_value, len(ranked_elo)), 2) if ranked_elo else 0.0
+        active_mean_elo = (
+            round(sum(active_elo_values) / len(active_elo_values), 2) if active_elo_values else 0.0
+        )
+        frontier_elo_drift = round(active_mean_elo - 1200.0, 2) if active_elo_values else 0.0
+
         return {
             "total_hypotheses": len(all_hypotheses),
             "active_hypotheses": len(active_hypotheses),
@@ -891,6 +1023,9 @@ class ContextMemory:
             "average_elo": round(
                 sum(hypothesis.elo_score for hypothesis in all_hypotheses) / len(all_hypotheses), 2
             ) if all_hypotheses else 0.0,
+            "active_median_elo": active_median_elo,
+            "top_k_elo": top_k_elo,
+            "frontier_elo_drift": frontier_elo_drift,
             "average_review_score": round(sum(scores) / len(scores), 2) if scores else 0.0,
             "strategies": strategies,
             "origins": origins,
@@ -904,11 +1039,11 @@ class ContextMemory:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "hypotheses": {key: hypothesis.to_dict() for key, hypothesis in self.hypotheses.items()},
-            "tournament_results": self.tournament_results,
-            "opencode_rerank_history": self.opencode_rerank_history,
-            "meta_review_feedback": self.meta_review_feedback,
-            "research_overviews": self.research_overviews,
-            "cycle_history": self.cycle_history,
+            "tournament_results": self.tournament_results[-500:],
+            "opencode_rerank_history": self.opencode_rerank_history[-20:],
+            "meta_review_feedback": self.meta_review_feedback[-20:],
+            "research_overviews": self.research_overviews[-10:],
+            "cycle_history": self.cycle_history[-50:],
             "reference_paper_context": self.reference_paper_context,
             "research_plan": self.research_plan.to_dict() if self.research_plan else None,
             "iteration_number": self.iteration_number,
@@ -936,6 +1071,7 @@ class ResearchGoalRequest(BaseModel):
     ranking_matches_per_cycle: Optional[int] = None
     proximity_similarity_threshold: Optional[float] = None
     hypothesis_decay_fraction: Optional[float] = None
+    max_active_hypotheses: Optional[int] = None
     max_concurrency: Optional[int] = None
 
 
